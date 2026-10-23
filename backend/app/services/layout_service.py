@@ -1,0 +1,529 @@
+"""画布手动排料服务（模块 3）。
+
+职责边界（与项目总约束一致：几何计算全在后端，前端只渲染）：
+    板材参数  -> layout_sheet 表（宽 / 高 / 四边余量 / 零件最小间距）
+    摆放状态  -> layout_placement 表（tx / ty / rot / locked）
+    合法性    -> 越界判定 + 零件重叠判定（pyclipper 求交，含最小间距）
+    输出      -> 按摆放状态变换后的轮廓，前端拿到即可绘制
+
+坐标约定（前后端共用）：
+    板材左下角为原点，X 向右、Y 向上，单位 mm；
+    tx/ty 表示"零件旋转后包围盒左下角"在板材上的位置。
+    这样前端拖动零件时只需 tx += dx / ty += dy，不需要在前端做旋转补偿，
+    旋转则以零件包围盒中心为锚点，视觉上不会跳。
+
+为什么不在前端做这几件事：
+    - 越界/重叠判定要处理旋转后的多边形，属于几何计算，前端只做像素渲染；
+    - 摆料结果是可持久化数据（工单回读），必须由后端落库后下发。
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from app.models import db
+from app.models.geometry import Polyline
+
+logger = logging.getLogger(__name__)
+
+# pyclipper 定点比例：1 mm = 1000 单位（与 ClipperEngine 保持一致）
+SCALE = 1000.0
+# 排料视图里轮廓 id 的起始值：与图纸轮廓（数据库自增 id）天然分开，
+# 前端据此不会把"排料结果"误当成"原始图形"。
+LAYOUT_POLY_BASE = 200_000
+# 浮点比较容差（mm）
+EPS = 1e-6
+# 判定"真重叠"的最小面积（mm²），避免相切被误判
+MIN_OVERLAP_AREA = 1e-3
+
+
+# ---------------------------------------------------------------- 数据结构
+@dataclass
+class LayoutPart:
+    """可摆料的零件：轮廓已平移到自身包围盒左下角（原点归一化）。"""
+
+    id: int
+    name: str
+    contours: List[np.ndarray]          # 全部轮廓（外轮廓 + 内孔），已归一化
+    width: float
+    height: float
+    outline: np.ndarray                 # 碰撞用外轮廓（面积最大的那条）
+    outline_index: int                  # 外轮廓在 contours 中的下标
+    area: float                         # 净面积（外轮廓 - 内孔）
+
+    def rotated_contours(self, rot: float, tx: float, ty: float) -> List[np.ndarray]:
+        """绕包围盒中心旋转，再平移；返回的包围盒左下角正好落在 (tx, ty)。"""
+        rad = math.radians(rot)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        cx, cy = self.width / 2.0, self.height / 2.0
+
+        rotated: List[np.ndarray] = []
+        for pts in self.contours:
+            dx = pts[:, 0].astype(np.float64) - cx
+            dy = pts[:, 1].astype(np.float64) - cy
+            rotated.append(np.stack([cx + dx * cos_a - dy * sin_a,
+                                     cy + dx * sin_a + dy * cos_a], axis=1))
+
+        all_pts = np.concatenate(rotated, axis=0) if rotated else np.zeros((1, 2))
+        min_x, min_y = float(all_pts[:, 0].min()), float(all_pts[:, 1].min())
+        shift = np.array([tx - min_x, ty - min_y], dtype=np.float64)
+        return [(arr + shift).astype(np.float32) for arr in rotated]
+
+    def rotated_outline(self, rot: float, tx: float, ty: float) -> np.ndarray:
+        """只算碰撞用的外轮廓，避免每次都变换全部内孔。"""
+        rad = math.radians(rot)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        cx, cy = self.width / 2.0, self.height / 2.0
+        pts = self.outline.astype(np.float64)
+        dx, dy = pts[:, 0] - cx, pts[:, 1] - cy
+        arr = np.stack([cx + dx * cos_a - dy * sin_a,
+                        cy + dx * sin_a + dy * cos_a], axis=1)
+        min_x, min_y = float(arr[:, 0].min()), float(arr[:, 1].min())
+        return arr - np.array([min_x - tx, min_y - ty], dtype=np.float64)
+
+    def size_at(self, rot: float) -> Tuple[float, float]:
+        """旋转后的包围盒尺寸（用于越界判定，不必变换全部顶点）。"""
+        if abs(rot % 180.0) < 1e-9:
+            return self.width, self.height
+        if abs(rot % 180.0 - 90.0) < 1e-9:
+            return self.height, self.width
+        rad = math.radians(rot)
+        cos_a, sin_a = abs(math.cos(rad)), abs(math.sin(rad))
+        return self.width * cos_a + self.height * sin_a, \
+            self.width * sin_a + self.height * cos_a
+
+
+@dataclass
+class Placement:
+    """一个零件在板材上的摆放状态。"""
+
+    part_id: int
+    sheet: int = 0
+    tx: float = 0.0
+    ty: float = 0.0
+    rot: float = 0.0
+    locked: bool = False
+    zorder: int = 0
+    # 木纹方向锁定：自动排料不旋转它，手动旋转也被拒绝（需先解锁）
+    fixed_rot: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "partId": self.part_id,
+            "sheet": self.sheet,
+            "tx": round(self.tx, 3),
+            "ty": round(self.ty, 3),
+            "rot": round(self.rot, 3),
+            "locked": self.locked,
+            "fixedRot": self.fixed_rot,
+            "zorder": self.zorder,
+        }
+
+
+@dataclass
+class LayoutState:
+    """一次排料操作所需的全量上下文。"""
+
+    project_id: int
+    sheet: Dict[str, float]
+    parts: List[LayoutPart] = field(default_factory=list)
+    placements: Dict[int, Placement] = field(default_factory=dict)
+
+    def part(self, part_id: int) -> Optional[LayoutPart]:
+        return next((p for p in self.parts if p.id == part_id), None)
+
+
+@dataclass
+class LayoutResult:
+    """一次写操作的结果：ok=False 时 reason 给前端弹提示，state 始终是最新状态。"""
+
+    ok: bool
+    reason: str
+    state: LayoutState
+
+
+# ---------------------------------------------------------------- 服务类
+class LayoutService:
+    """零件摆放与板材参数的服务类（无状态，所有数据来自 SQLite）。"""
+
+    def __init__(self) -> None:
+        try:
+            import pyclipper
+            self._pc = pyclipper
+        except ImportError:                     # pragma: no cover - 依赖缺失时的兜底
+            self._pc = None
+            logger.warning("pyclipper 不可用：排料的零件重叠校验将退化为包围盒判定")
+
+    # ------------------------------------------------------------ 载入
+    def load(self, conn: Any, project_id: int) -> LayoutState:
+        """从数据库组装排料上下文（轮廓归一化、摆放状态原样读出）。"""
+        sheet = db.load_sheet(conn, project_id)
+        raw_parts = db.load_parts(conn, project_id)
+        rows = db.load_polylines(conn, project_id)
+        placements = {pid: Placement(
+            part_id=pid, sheet=int(p["sheet"]), tx=float(p["tx"]), ty=float(p["ty"]),
+            rot=float(p["rot"]), locked=bool(p["locked"]), zorder=int(p["zorder"]),
+            fixed_rot=bool(p.get("fixedRot", False)),
+        ) for pid, p in db.load_placements(conn, project_id).items()}
+
+        by_part: Dict[int, List[Dict[str, Any]]] = {}
+        for row in rows:
+            if row["part_id"]:
+                by_part.setdefault(int(row["part_id"]), []).append(row)
+
+        parts: List[LayoutPart] = []
+        for raw in raw_parts:
+            items = by_part.get(int(raw["id"]), [])
+            if not items:
+                continue
+            part = self._make_part(int(raw["id"]), str(raw["name"]), items)
+            if part is not None:
+                parts.append(part)
+
+        # 防御：摆放记录里可能残留已删除零件的 part_id（旧库/异常中断），直接丢弃
+        known = {p.id for p in parts}
+        placements = {pid: p for pid, p in placements.items() if pid in known}
+
+        return LayoutState(project_id=project_id, sheet=sheet, parts=parts,
+                           placements=placements)
+
+    @staticmethod
+    def _make_part(part_id: int, name: str, items: Sequence[Dict[str, Any]]) -> Optional[LayoutPart]:
+        """把零件下所有轮廓一起平移到包围盒左下角（共用同一个偏移，内孔不会错位）。"""
+        arrays = [np.asarray(it["pts"], dtype=np.float64) for it in items if len(it["pts"]) > 0]
+        if not arrays:
+            return None
+
+        all_pts = np.concatenate(arrays, axis=0)
+        min_xy = all_pts.min(axis=0)
+        normalized = [(arr - min_xy).astype(np.float32) for arr in arrays]
+        width = float(all_pts[:, 0].max() - min_xy[0])
+        height = float(all_pts[:, 1].max() - min_xy[1])
+
+        # 外轮廓 = 面积绝对值最大的那条；净面积 = 外轮廓 - 其余（内孔）
+        # 不依赖轮廓方向：示例图形/第三方 DXF 的内孔方向未必统一
+        areas = [abs(LayoutService._signed_area(arr)) for arr in normalized]
+        outline_idx = int(np.argmax(areas)) if areas else 0
+        outline = normalized[outline_idx].astype(np.float64)
+        if sum(areas) <= 0:
+            return None
+        net_area = max(0.0, areas[outline_idx] - (sum(areas) - areas[outline_idx]))
+
+        return LayoutPart(id=part_id, name=name, contours=normalized,
+                          width=max(width, EPS), height=max(height, EPS),
+                          outline=outline, outline_index=outline_idx, area=net_area)
+
+    @staticmethod
+    def _signed_area(pts: np.ndarray) -> float:
+        if len(pts) < 3:
+            return 0.0
+        x, y = pts[:, 0], pts[:, 1]
+        return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+    # ------------------------------------------------------------ 初始化
+    def open(self, conn: Any, project_id: int) -> LayoutState:
+        """进入排料模式：没有摆放记录时按行排做一次初始摆放。"""
+        state = self.load(conn, project_id)
+        if not state.parts:
+            return state
+        if not state.placements:
+            self._initial_layout(conn, state)
+            state.placements = {pid: Placement(
+                part_id=pid, sheet=int(p["sheet"]), tx=float(p["tx"]), ty=float(p["ty"]),
+                rot=float(p["rot"]), locked=bool(p["locked"]), zorder=int(p["zorder"]),
+                fixed_rot=bool(p.get("fixedRot", False)),
+            ) for pid, p in db.load_placements(conn, project_id).items()}
+        return state
+
+    def _initial_layout(self, conn: Any, state: LayoutState) -> None:
+        """行排初始摆放：高件优先，自下而上逐行摆。
+
+        这只是"进排料模式时的初始位置"，不追求利用率（自动排料是模块 4）；
+        超出板材的零件继续往下摆并在 stats 里报 overflow，用户能看见也能拖回来。
+        """
+        margin = float(state.sheet["margin"])
+        gap = float(state.sheet["gap"])
+        sheet_w = float(state.sheet["width"])
+
+        ordered = sorted(state.parts, key=lambda p: (p.height, p.width), reverse=True)
+        x, y, row_h = margin, margin, 0.0
+        for index, part in enumerate(ordered):
+            if x + part.width + margin > sheet_w and row_h > 0:
+                x = margin
+                y += row_h + gap
+                row_h = 0.0
+            db.save_placement(conn, state.project_id, part.id, 0,
+                              round(x, 3), round(y, 3), 0.0, False, index)
+            x += part.width + gap
+            row_h = max(row_h, part.height)
+
+    # ------------------------------------------------------------ 写操作
+    def set_sheet(self, conn: Any, project_id: int, width: float, height: float,
+                  margin: float, gap: float) -> LayoutResult:
+        """保存板材参数；越界零件夹回可用区域（不改变相对布局）。"""
+        if width <= 0 or height <= 0:
+            return LayoutResult(False, "板材尺寸必须大于 0", self.load(conn, project_id))
+        if margin < 0 or gap < 0:
+            return LayoutResult(False, "余量与间距不能为负数", self.load(conn, project_id))
+        if width - 2 * margin <= 0 or height - 2 * margin <= 0:
+            return LayoutResult(False, "四边余量之和超过板材尺寸", self.load(conn, project_id))
+
+        db.save_sheet(conn, project_id, {"width": width, "height": height,
+                                         "margin": margin, "gap": gap})
+        state = self.load(conn, project_id)
+
+        # 板变小了：把越界零件夹回可用区域，避免出现"看不见的零件"
+        for part in state.parts:
+            placement = state.placements.get(part.id)
+            if placement is None:
+                continue
+            w, h = part.size_at(placement.rot)
+            tx = min(max(placement.tx, margin), max(margin, width - margin - w))
+            ty = min(max(placement.ty, margin), max(margin, height - margin - h))
+            if abs(tx - placement.tx) > EPS or abs(ty - placement.ty) > EPS:
+                placement.tx, placement.ty = tx, ty
+                db.save_placement(conn, project_id, part.id, placement.sheet,
+                                  tx, ty, placement.rot, placement.locked, placement.zorder,
+                                  fixed_rot=placement.fixed_rot)
+        return LayoutResult(True, "", state)
+
+    def move(self, conn: Any, project_id: int, part_id: int,
+             tx: float, ty: float, rot: Optional[float] = None) -> LayoutResult:
+        """移动（可同时改角度）一个零件；校验不通过时不落库。"""
+        state = self.load(conn, project_id)
+        part = state.part(part_id)
+        placement = state.placements.get(part_id)
+        if part is None or placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+        if placement.locked and rot is None:
+            return LayoutResult(False, f"零件「{part.name}」已锁定，先解锁再移动", state)
+        if placement.locked and rot is not None and abs(rot - placement.rot) > EPS:
+            return LayoutResult(False, f"零件「{part.name}」已锁定，不能旋转", state)
+        if (placement.fixed_rot and rot is not None
+                and abs(rot - placement.rot) > EPS):
+            return LayoutResult(False, f"零件「{part.name}」已锁定旋转角度（木纹），先解锁再转", state)
+
+        target_rot = placement.rot if rot is None else float(rot)
+        error = self._check(state, part, target_rot, float(tx), float(ty), exclude=part_id)
+        if error:
+            return LayoutResult(False, error, state)
+
+        placement.tx, placement.ty, placement.rot = float(tx), float(ty), target_rot
+        db.save_placement(conn, project_id, part_id, placement.sheet,
+                          placement.tx, placement.ty, placement.rot,
+                          placement.locked, placement.zorder,
+                          fixed_rot=placement.fixed_rot)
+        return LayoutResult(True, "", state)
+
+    def rotate(self, conn: Any, project_id: int, part_id: int, rot: float) -> LayoutResult:
+        """旋转到指定角度：以包围盒中心为锚点，位置自动补偿。"""
+        state = self.load(conn, project_id)
+        part = state.part(part_id)
+        placement = state.placements.get(part_id)
+        if part is None or placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+        if placement.locked:
+            return LayoutResult(False, f"零件「{part.name}」已锁定，不能旋转", state)
+        if placement.fixed_rot:
+            return LayoutResult(False, f"零件「{part.name}」已锁定旋转角度（木纹），先解锁再转", state)
+
+        old_w, old_h = part.size_at(placement.rot)
+        center_x = placement.tx + old_w / 2.0
+        center_y = placement.ty + old_h / 2.0
+        new_w, new_h = part.size_at(rot)
+
+        # 旋转后先保持中心不动；若因此越界，就把零件夹回可用区域再试，
+        # 大件在板边旋转时这是最符合直觉的行为（不横向跑出板外）。
+        margin = float(state.sheet["margin"])
+        max_x = max(margin, float(state.sheet["width"]) - margin - new_w)
+        max_y = max(margin, float(state.sheet["height"]) - margin - new_h)
+        tx = min(max(center_x - new_w / 2.0, margin), max_x)
+        ty = min(max(center_y - new_h / 2.0, margin), max_y)
+        return self.move(conn, project_id, part_id, tx, ty, rot)
+
+    def set_locked(self, conn: Any, project_id: int, part_id: int, locked: bool) -> LayoutResult:
+        state = self.load(conn, project_id)
+        placement = state.placements.get(part_id)
+        if placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+        placement.locked = bool(locked)
+        db.save_placement(conn, project_id, part_id, placement.sheet,
+                          placement.tx, placement.ty, placement.rot,
+                          placement.locked, placement.zorder,
+                          fixed_rot=placement.fixed_rot)
+        return LayoutResult(True, "", state)
+
+    def set_fixed_rot(self, conn: Any, project_id: int, part_id: int,
+                      fixed_rot: bool) -> LayoutResult:
+        """锁定/解锁旋转角度（木纹方向）：自动排料不再旋转该零件。"""
+        state = self.load(conn, project_id)
+        placement = state.placements.get(part_id)
+        if placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+        placement.fixed_rot = bool(fixed_rot)
+        db.save_placement(conn, project_id, part_id, placement.sheet,
+                          placement.tx, placement.ty, placement.rot,
+                          placement.locked, placement.zorder,
+                          fixed_rot=placement.fixed_rot)
+        return LayoutResult(True, "", state)
+
+    def reset(self, conn: Any, project_id: int) -> LayoutResult:
+        """清空摆放并重新做一次初始行排。"""
+        db.clear_placements(conn, project_id)
+        state = self.open(conn, project_id)
+        return LayoutResult(True, "", state)
+
+    # ------------------------------------------------------------ 校验
+    def _check(self, state: LayoutState, part: LayoutPart, rot: float,
+               tx: float, ty: float, exclude: int) -> str:
+        """返回空串表示合法，否则返回中文原因。"""
+        margin = float(state.sheet["margin"])
+        right = float(state.sheet["width"]) - margin
+        top = float(state.sheet["height"]) - margin
+        w, h = part.size_at(rot)
+
+        if tx < margin - EPS:
+            return f"零件「{part.name}」超出板材左边界"
+        if ty < margin - EPS:
+            return f"零件「{part.name}」超出板材下边界"
+        if tx + w > right + EPS:
+            return f"零件「{part.name}」超出板材右边界（可用宽度 {right - margin:.1f}mm）"
+        if ty + h > top + EPS:
+            return f"零件「{part.name}」超出板材上边界（可用高度 {top - margin:.1f}mm）"
+
+        outline = part.rotated_outline(rot, tx, ty)
+        box = (min(float(outline[:, 0].min()), tx), min(float(outline[:, 1].min()), ty),
+               max(float(outline[:, 0].max()), tx + w), max(float(outline[:, 1].max()), ty + h))
+
+        gap = float(state.sheet["gap"])
+        for other in state.parts:
+            if other.id == exclude:
+                continue
+            other_place = state.placements.get(other.id)
+            if other_place is None or other_place.sheet != 0:
+                continue
+            other_w, other_h = other.size_at(other_place.rot)
+            if box[2] + gap <= other_place.tx or other_place.tx + other_w + gap <= box[0]:
+                continue
+            if box[3] + gap <= other_place.ty or other_place.ty + other_h + gap <= box[1]:
+                continue
+
+            other_outline = other.rotated_outline(other_place.rot, other_place.tx, other_place.ty)
+            if self._overlaps(outline, other_outline, gap):
+                return f"零件「{part.name}」与「{other.name}」间距不足 {gap:g}mm"
+        return ""
+
+    def _overlaps(self, a: np.ndarray, b: np.ndarray, gap: float) -> bool:
+        """两个多边形在留出 gap 间距后是否冲突。
+
+        做法：双方各向外扩 gap/2 后求交，交面积 > 0 即视为间距不足。
+        圆角外扩在对角方向略保守，工程上可接受（宁可留缝不可撞刀）。
+        """
+        if self._pc is None:
+            return True          # 没有 clipper 时退化为保守判定（只要包围盒相交就拒绝）
+        pc = self._pc
+        try:
+            clipper = pc.Pyclipper()
+            clipper.AddPath(self._inflate(a, gap / 2.0, pc), pc.PT_SUBJECT, True)
+            clipper.AddPath(self._inflate(b, gap / 2.0, pc), pc.PT_CLIP, True)
+            solution = clipper.Execute(pc.CT_INTERSECTION, pc.PFT_NONZERO, pc.PFT_NONZERO)
+            total = 0.0
+            for path in solution:
+                total += abs(pc.Area(path))
+            return total / (SCALE * SCALE) > MIN_OVERLAP_AREA
+        except Exception:        # 退化数据（自交等）不应让拖拽崩掉
+            logger.warning("排料重叠校验失败，按冲突处理", exc_info=True)
+            return True
+
+    @staticmethod
+    def _inflate(pts: np.ndarray, delta: float, pc: Any) -> List[Tuple[int, int]]:
+        """多边形向外扩 delta（mm），用于把"最小间距"转成"求交"判定。"""
+        path = [(int(round(x * SCALE)), int(round(y * SCALE))) for x, y in pts]
+        offset = pc.PyclipperOffset()
+        offset.AddPath(path, pc.JT_ROUND, pc.ET_CLOSEDPOLYGON)
+        result = offset.Execute(delta * SCALE)
+        return result[0] if result else path
+
+    # ------------------------------------------------------------ 输出
+    def build_polylines(self, state: LayoutState) -> Tuple[List[Polyline], Dict[int, List[int]]]:
+        """按摆放状态变换零件轮廓，返回 (轮廓列表, part_id -> 轮廓 id 列表)。"""
+        polylines: List[Polyline] = []
+        id_map: Dict[int, List[int]] = {}
+        next_id = LAYOUT_POLY_BASE
+
+        for part in state.parts:
+            placement = state.placements.get(part.id)
+            if placement is None:
+                continue
+            ids: List[int] = []
+            for index, pts in enumerate(part.rotated_contours(placement.rot,
+                                                             placement.tx, placement.ty)):
+                # 图层号用板材序号 + 1：多板排料时前端按图层上色
+                poly = Polyline(next_id, placement.sheet + 1, pts, True,
+                                is_hole=index != part.outline_index, part_id=part.id)
+                polylines.append(poly)
+                ids.append(next_id)
+                next_id += 1
+            id_map[part.id] = ids
+        return polylines, id_map
+
+    def build_meta(self, state: LayoutState, id_map: Dict[int, List[int]]) -> Dict[str, Any]:
+        """组装摆放结果的 meta（板材参数 + 零件表 + 统计）。"""
+        sheet_area = max(1.0, float(state.sheet["width"]) * float(state.sheet["height"]))
+        used_area = sum(part.area for part in state.parts if part.id in state.placements)
+        margin = float(state.sheet["margin"])
+
+        overflow = 0
+        for part in state.parts:
+            placement = state.placements.get(part.id)
+            if placement is None:
+                continue
+            w, h = part.size_at(placement.rot)
+            if (placement.tx < margin - EPS or placement.ty < margin - EPS
+                    or placement.tx + w > float(state.sheet["width"]) - margin + EPS
+                    or placement.ty + h > float(state.sheet["height"]) - margin + EPS):
+                overflow += 1
+
+        return {
+            "projectId": state.project_id,
+            "sheet": {k: round(float(v), 3) for k, v in state.sheet.items()},
+            "parts": [
+                {
+                    "id": part.id,
+                    "name": part.name,
+                    "width": round(part.width, 3),
+                    "height": round(part.height, 3),
+                    "polylineIds": id_map.get(part.id, []),
+                    "tx": round(state.placements[part.id].tx, 3),
+                    "ty": round(state.placements[part.id].ty, 3),
+                    "rot": round(state.placements[part.id].rot, 3),
+                    "locked": state.placements[part.id].locked,
+                    "fixedRot": state.placements[part.id].fixed_rot,
+                }
+                for part in state.parts if part.id in state.placements
+            ],
+            "placements": [p.as_dict() for p in state.placements.values()],
+            "stats": {
+                "partCount": len(state.parts),
+                "placementCount": len(state.placements),
+                "lockedCount": sum(1 for p in state.placements.values() if p.locked),
+                "fixedRotCount": sum(1 for p in state.placements.values() if p.fixed_rot),
+                "overflowCount": overflow,
+                "usedArea": round(used_area, 1),
+                "sheetArea": round(sheet_area, 1),
+                "utilization": round(used_area / sheet_area, 4),
+                "sheetWidth": round(float(state.sheet["width"]), 3),
+                "sheetHeight": round(float(state.sheet["height"]), 3),
+                "gap": round(float(state.sheet["gap"]), 3),
+                "margin": round(margin, 3),
+            },
+        }
+
+
+# 全局单例：无状态，可被多线程共用
+layout_service = LayoutService()
