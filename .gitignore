@@ -1,0 +1,42 @@
+# ---------------- Python ----------------
+backend/.venv/
+backend/build/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------------- Node / 前端 ----------------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+
+# ---------------- Tauri / Rust ----------------
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+frontend/src-tauri/backend/
+!frontend/src-tauri/backend/.gitkeep
+
+# ---------------- 图标（可由 scripts/gen_icons.ps1 重新生成） ----------------
+# 如果换成正式设计稿图标，请删掉下面四行并把图标纳入版本管理
+frontend/src-tauri/icons/*.png
+frontend/src-tauri/icons/*.ico
+
+# ---------------- 运行时数据 ----------------
+*.db
+*.db-wal
+*.db-shm
+backend/logs/
+exports/
+*.nc
+*.plt
+*.cut
+
+# ---------------- 编辑器 / 系统 ----------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
