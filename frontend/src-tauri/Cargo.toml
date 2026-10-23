@@ -1,0 +1,44 @@
+# 产物形态（重要）：
+#   主交付 = target\release\btcam.exe 单文件（后端 cam-backend.exe 由 build.rs 内嵌）
+#   次交付 = NSIS 安装包 / MSI（由 scripts/build.ps1 统一汇总到 dist\）
+# 注意：tauri.conf.json 的 bundle.resources 故意留空，
+#       否则安装目录会多出一份后端 exe，既占空间又能被单独启动。
+[package]
+name = "btcam"
+version = "0.1.0"
+description = "BtCAM 2D 轮廓切割 CAM 桌面端"
+authors = ["BtSoft"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+# Tauri 2 约定：移动端需要 staticlib/cdylib，桌面端用 rlib
+name = "btcam_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ------------------------------------------------------------------
+# Release 极致优化：面向"单 exe、高性能"两个目标
+#   opt-level=3    : 最高运行速度（几何/IO 转发都在 Rust 侧，值得）
+#   lto=true       : 跨 crate 内联，前缀树式裁剪未用代码
+#   codegen-units=1: 单个代码生成单元，允许更深优化
+#   panic=abort    : 去掉 unwind 表，减小体积、提升指令缓存命中
+#   strip=symbols  : 去掉符号表，通常再省 30%~40% 体积
+#   incremental=false: Release 不需要增量编译产物
+# ------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+overflow-checks = false
+debug = false
