@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------
+# BtCAM 后端依赖
+#   推荐：Python 3.11（OCCT 绑定生态最完整）
+#   兼容：Python 3.8+（版本差异用环境标记处理）
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+# ---------------------------------------------------------------
+
+# --- Web 服务 ---
+fastapi==0.115.6
+# uvicorn 0.34+ 要求 Python 3.9+；3.8 退到 0.33 且不装 [standard]
+# （[standard] 里的 watchfiles/httptools 新版本已不支持 3.8，
+#   websockets 已在下方显式声明，足以支撑 WS）
+uvicorn[standard]==0.34.0; python_version >= "3.9"
+uvicorn==0.33.0; python_version < "3.9"
+websockets==14.1; python_version >= "3.9"
+websockets==13.1; python_version < "3.9"
+pydantic==2.10.4
+python-multipart==0.0.20
+
+# --- 数值计算 ---
+# numpy 2.x 仅支持 Python 3.10+，3.8/3.9 退到 1.x 分支
+numpy==2.2.1; python_version >= "3.10"
+numpy==1.24.4; python_version < "3.10"
+
+# --- 2D 几何（兜底引擎，强烈建议装上，体积约 1MB）---
+pyclipper==1.3.0.post6
+
+# --- DXF 解析（模块1）---
+# ezdxf 1.1 起要求 Python 3.9+；3.8 锁在 1.0.x 分支（API 与 1.x 基本一致）
+ezdxf==1.3.4; python_version >= "3.9"
+ezdxf==1.0.3; python_version < "3.9"
+
+# ---------------------------------------------------------------
+# OpenCASCADE 几何内核（模块2 主力引擎）
+#
+# PyPI 的 cadquery-ocp 轮子：7.8.x 起要求 Python 3.9+，3.8 锁在 7.7.x
+# （7.7.2 是最后一个提供 cp38 wheel 的版本）
+# 未安装也能启动：几何层自动降级到 pyclipper（偏移/布尔能力受限）。
+#
+# 如果改用 conda 的 pythonocc-core，请注释掉下面两行，避免装两份 OCCT：
+#   conda install -c conda-forge pythonocc-core=7.8.0
+# ---------------------------------------------------------------
+cadquery-ocp==7.8.1; python_version >= "3.9"
+cadquery-ocp==7.7.2; python_version < "3.9"
+
+# --- 排料 ---
+# DeepNest 官方为 JS 实现，这里通过外部进程桥接：
+#   设置环境变量 BTCAM_DEEPNEST_CMD="node D:\tools\deepnest\bridge.js"
+# 未配置时自动使用内置行排算法（nesting_service.ShelfNester）。
+
+# --- 打包（可选，生成 sidecar exe）---
+# pyinstaller==6.11.1
