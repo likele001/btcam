@@ -40,3 +40,4 @@ exports/
 *.swp
 Thumbs.db
 desktop.ini
+vs_buildtools.exe
