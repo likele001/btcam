@@ -151,6 +151,23 @@ class PostProcessorRequest(BaseModel):
     dxf: Optional[Dict[str, Any]] = None
 
 
+class PostDraftRequest(BaseModel):
+    """后处理草稿（模块 11）：可视化编辑器提交的整份配置。
+
+    processor 原样收下，不在 pydantic 层做限制，交给 post.editor 逐字段校验，
+    这样错误能带上 `gcode.cutXY` 这类字段名，前端才能高亮对应输入框。
+    """
+
+    processor: Dict[str, Any]
+    processorId: Optional[str] = None
+
+
+class PostPreviewRequest(PostDraftRequest):
+    """预览请求：options 为假数据（尺寸/主轴/是否翻转等），不影响真实刀路。"""
+
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TaskAccepted(BaseModel):
     taskId: str
     kind: str
@@ -313,6 +330,98 @@ class TemplateRequest(BaseModel):
     toolId: Optional[int] = None
     params: TemplateParams = Field(default_factory=TemplateParams)
     note: str = ""
+
+
+# ---------------------------------------------------------------- 余料库（模块 10）
+class ScrapRequest(BaseModel):
+    """新建/修改余料。
+
+    outline 为空时用 width/height 生成矩形轮廓（手工录一块方料）；
+    宽高与面积最终由后端从轮廓算出，前端传的值只作参考。
+    """
+
+    projectId: Optional[int] = None
+    name: str = Field("", max_length=64)
+    code: str = Field("", max_length=64, description="余料编号（贴标/扫码）")
+    material: str = Field("", max_length=64)
+    thickness: float = Field(0.0, ge=0.0, le=1000.0)
+    width: Optional[float] = Field(None, gt=0.0, le=100000.0)
+    height: Optional[float] = Field(None, gt=0.0, le=100000.0)
+    outline: List[List[float]] = Field(
+        default_factory=list, description="轮廓点 [[x,y],...]，坐标系与板材一致")
+    note: str = Field("", max_length=500)
+
+
+class ScrapRemainingRequest(BaseModel):
+    """计算当前板材的剩余区域（预览，不落库）。"""
+
+    projectId: Optional[int] = None
+    gap: Optional[float] = Field(None, ge=0.0, le=5000.0,
+                                 description="不传则用板材当前最小间距")
+    minArea: float = Field(10000.0, ge=0.0, le=1e9, description="小于该面积(mm²)的碎料不列出")
+
+
+class ScrapSaveRequest(ScrapRemainingRequest):
+    """把选中的剩余区域存进余料库（index 来自 /api/scrap/remaining 的返回）。"""
+
+    indices: List[int] = Field(default_factory=list)
+    namePrefix: str = Field("", max_length=40)
+    material: str = Field("", max_length=64)
+    thickness: float = Field(0.0, ge=0.0, le=1000.0)
+    note: str = Field("", max_length=500)
+
+
+class ScrapApplyRequest(BaseModel):
+    """把余料设为当前排料板（复用排料接口，轮廓作为边界）。"""
+
+    projectId: Optional[int] = None
+    gap: Optional[float] = Field(None, ge=0.0, le=5000.0)
+    resetPlacements: bool = Field(True, description="换板后按新尺寸重新初始行排")
+
+
+class ScrapClearRequest(BaseModel):
+    """解绑余料，退回规则矩形板（可选同时套用新尺寸）。"""
+
+    projectId: Optional[int] = None
+    width: Optional[float] = Field(None, gt=0.0, le=100000.0)
+    height: Optional[float] = Field(None, gt=0.0, le=100000.0)
+    margin: Optional[float] = Field(None, ge=0.0, le=5000.0)
+    gap: Optional[float] = Field(None, ge=0.0, le=5000.0)
+
+
+# ---------------------------------------------------------------- MES 对接（模块 12）
+
+class MesSettingsRequest(BaseModel):
+    """保存 MES 配置。
+
+    这里不做范围校验（pydantic 报 422 会盖掉 settings.py 里的中文提示），
+    统一交给 settings.build()，路由层再把 MesConfigError 翻成 400。
+    """
+
+    enabled: bool = False
+    vendor: str = "cenkor"
+    baseUrl: str = ""
+    apiKey: Optional[str] = None      # 留空 = 沿用已保存的密钥
+    timeout: float = 8.0
+    retries: int = 2
+    autoPush: bool = False
+    includeFiles: bool = True
+    paths: Dict[str, str] = Field(default_factory=dict)
+
+
+class MesPullRequest(BaseModel):
+    """从 MES 拉单。"""
+
+    projectId: Optional[int] = None
+    limit: int = Field(50, ge=1, le=200)
+
+
+class MesPushRequest(BaseModel):
+    """回传归档；workOrderId 不传时后端按 MES 单号自动找同编号本地工单。"""
+
+    orderId: int
+    workOrderId: Optional[int] = None
+    includeFiles: Optional[bool] = None
 
 
 class HealthResponse(BaseModel):

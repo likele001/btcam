@@ -10,12 +10,15 @@
  */
 
 import type { ConnectionState } from '@/types/geometry';
+import { APP_VERSION } from '@/version';
 import { ChunkAssembler, decodeFrames, encodeFrames, MsgType, type Frame } from './protocol';
 
 export type FrameHandler = (frame: Frame) => void;
 
 const MAX_BACKOFF_MS = 10_000;
 const HEARTBEAT_MS = 15_000;
+/** 连续这么久没收到任何帧（包括 PONG）就认定连接已死，主动断开重连 */
+const DEAD_AFTER_MS = HEARTBEAT_MS * 3;
 
 export class WsClient {
   private url: string;
@@ -26,6 +29,9 @@ export class WsClient {
   private seq = 0;
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
+  /** 最近一次收到服务端帧的时间（心跳靠它判活）：半开连接不会触发 onclose，
+   *  只发不收会让界面一直停在“在线”而实际拿不到任何数据 */
+  private lastSeenAt = 0;
   private disposed = false;
   /** 大 payload 的分片重组器：整条连接共享 */
   private assembler = new ChunkAssembler();
@@ -53,15 +59,17 @@ export class WsClient {
 
     socket.onopen = () => {
       this.retry = 0;
+      this.lastSeenAt = Date.now();
       this.onStateChange?.('online');
       this.startHeartbeat();
-      this.sendFrame(MsgType.HELLO, { clientVersion: '0.1.0' });
+      this.sendFrame(MsgType.HELLO, { clientVersion: APP_VERSION });
       this.flushPending();
       this.onOpen?.();
     };
 
     socket.onmessage = (event: MessageEvent<ArrayBuffer>) => {
       if (!(event.data instanceof ArrayBuffer)) return;
+      this.lastSeenAt = Date.now();
       try {
         for (const frame of decodeFrames(event.data)) {
           // CHUNK 帧先累积，凑齐后才会拿到真正的业务帧
@@ -99,6 +107,14 @@ export class WsClient {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = window.setInterval(() => {
+      // 只发不收 = 半开连接：服务端已不可达但 TCP 没断，onclose 不会触发。
+      // 主动关掉，让 onclose 走正常的重连退避。
+      if (this.lastSeenAt > 0 && Date.now() - this.lastSeenAt > DEAD_AFTER_MS) {
+        console.warn('[ws] 心跳无回应，主动断开重连');
+        this.lastSeenAt = 0;
+        this.socket?.close();
+        return;
+      }
       this.sendFrame(MsgType.PING, { t: Date.now() });
     }, HEARTBEAT_MS);
   }

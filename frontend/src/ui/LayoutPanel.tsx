@@ -12,11 +12,15 @@ import type { LayoutNestParams } from '@/net/rest';
 import { useAppStore } from '@/state/app-store';
 import type { LayoutPartInfo, SheetSpec } from '@/types/geometry';
 import { useLayoutActions } from './useLayoutActions';
+import { useScrapActions } from './useScrapActions';
 
 /** 与后端 db.py 的 layout_sheet 默认值保持一致 */
 const DEFAULT_SHEET: SheetSpec = { width: 1220, height: 2440, margin: 10, gap: 5 };
 
-const SHEET_FIELDS: Array<{ key: keyof SheetSpec; label: string; min: number; step: number }> = [
+/** 可编辑的板材数值字段；scrapId 由余料接口维护，不在表单里出现 */
+type SheetNumberKey = 'width' | 'height' | 'margin' | 'gap';
+
+const SHEET_FIELDS: Array<{ key: SheetNumberKey; label: string; min: number; step: number }> = [
   { key: 'width', label: '板宽 (mm)', min: 10, step: 10 },
   { key: 'height', label: '板高 (mm)', min: 10, step: 10 },
   { key: 'margin', label: '四边余量 (mm)', min: 0, step: 1 },
@@ -33,6 +37,8 @@ export function LayoutPanel(): JSX.Element {
 
   const { applySheet, rotateSelected, lockSelected, fixedRotSelected, nest, cancelNest, reset } =
     useLayoutActions();
+  // 余料（模块 10）：绑定/解绑都走余料接口，轮廓与边界仍由后端提供
+  const { open: openScrap, clearSheet } = useScrapActions();
 
   // 自动排料参数：引擎与是否允许 90° 旋转（木纹锁定件始终不转）
   const [engine, setEngine] = useState<LayoutNestParams['engine']>('auto');
@@ -48,7 +54,7 @@ export function LayoutPanel(): JSX.Element {
     if (layout && !dirty) setSheet(layout.sheet);
   }, [layout, dirty]);
 
-  const onField = (key: keyof SheetSpec) => (event: ChangeEvent<HTMLInputElement>) => {
+  const onField = (key: SheetNumberKey) => (event: ChangeEvent<HTMLInputElement>) => {
     const value = Number(event.target.value);
     setSheet((prev) => ({ ...prev, [key]: Number.isFinite(value) ? value : prev[key] }));
     setDirty(true);
@@ -70,10 +76,54 @@ export function LayoutPanel(): JSX.Element {
   const allLocked = selected.length > 0 && selected.every((part) => part.locked);
   const allFixedRot = selected.length > 0 && selected.every((part) => part.fixedRot);
   const stats = layout?.stats;
+  // 当前板材是不是余料：是的话宽高由余料轮廓决定，改宽高会被后端自动解绑
+  const boundScrap = layout?.scrap ?? null;
+
+  const onUnbind = async () => {
+    setBusy(true);
+    try {
+      await clearSheet();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <aside className="panel panel-left">
       <div className="panel-title">排料板</div>
+
+      {boundScrap ? (
+        <div className="panel-scrap">
+          <div className="panel-scrap-head">
+            <span className="panel-scrap-name" title={boundScrap.note || boundScrap.name}>
+              {boundScrap.name}
+            </span>
+            <button
+              type="button"
+              className="btn btn-ghost panel-scrap-btn"
+              onClick={() => void onUnbind()}
+              disabled={busy}
+              title="解绑余料，退回规则矩形板"
+            >
+              退回整板
+            </button>
+          </div>
+          <div className="panel-scrap-meta">
+            余料 #{boundScrap.id} · {boundScrap.width.toFixed(1)}×{boundScrap.height.toFixed(1)}mm
+            {boundScrap.points > 0 ? ` · ${boundScrap.points} 点轮廓` : ''}
+          </div>
+          <div className="panel-scrap-hint">
+            轮廓即板材边界，零件只能摆在轮廓内；改板宽/板高会自动退回整板
+          </div>
+        </div>
+      ) : (
+        <div className="panel-scrap panel-scrap-empty">
+          <span>当前是规则整板</span>
+          <button type="button" className="btn btn-ghost panel-scrap-btn" onClick={openScrap}>
+            选余料…
+          </button>
+        </div>
+      )}
 
       <div className="form">
         {SHEET_FIELDS.map((field) => (

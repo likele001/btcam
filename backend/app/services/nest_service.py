@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.models import db
 from app.services.layout_service import (
     EPS,
+    PARK_OFFSET,
     LayoutPart,
     LayoutService,
     LayoutState,
@@ -50,12 +51,16 @@ class PartTask:
 class ScanPacker:
     """底线扫描排料（Bottom-Left）。
 
-    候选位置来自"已放零件包围盒的右上角"：左边贴齐 + 下边贴齐是排料解的两个
-    常见极值点，逐个用 LayoutService._check 验证即可保证间距与边界正确。
-    相比模块 2 的 ShelfNester（只按行游标摆放），它天然支持障碍物与定角零件。
+    候选位置来自"已放零件包围盒的右上角"与"余料轮廓顶点"：左边贴齐 + 下边贴齐
+    是排料解的两个常见极值点，逐个用 LayoutService._check 验证即可保证间距与边界
+    正确。相比模块 2 的 ShelfNester（只按行游标摆放），它天然支持障碍物与定角零件。
     """
 
     name = "scan"
+
+    # 余料轮廓顶点候选的上限：布尔差会吐出大量共线点，超过就按更粗的网格去重，
+    # 保证候选集规模可控（每个候选都要过一次 clipper 校验）
+    MAX_BOUNDARY_CANDIDATES = 600
 
     def __init__(self, service: LayoutService, state: LayoutState,
                  rotation: bool, report: Any = None) -> None:
@@ -101,7 +106,7 @@ class ScanPacker:
         return None
 
     def _candidates(self, margin: float, gap: float) -> List[Tuple[float, float]]:
-        """候选点集：板内左下角 + 每个已放零件右侧/上侧的贴边点。
+        """候选点集：板内左下角 + 每个已放零件右侧/上侧的贴边点 + 余料轮廓顶点。
 
         排序按 (y, x)：先往下压，再往左贴，得到经典的底线填充效果。
         """
@@ -115,8 +120,40 @@ class ScanPacker:
             points.add((placement.tx, placement.ty + height + gap))
             points.add((margin, placement.ty + height + gap))
             points.add((placement.tx + width + gap, margin))
-        # 候选点最多几十个（零件数量级），排序后再按轮廓校验，避免无谓的 clipper 调用
+        points.update(self._boundary_candidates(margin))
+        # 候选点最多几百个（零件数量级 + 轮廓顶点），排序后再按轮廓校验，避免无谓的 clipper 调用
         return sorted(points, key=lambda item: (round(item[1], 3), round(item[0], 3)))
+
+    def _boundary_candidates(self, margin: float) -> List[Tuple[float, float]]:
+        """余料轮廓上的落脚点（模块 10 凹形余料）。
+
+        规则板（boundary is None）不产生额外候选，行为与改造前完全一致。
+        之所以需要它：余料板 margin=0，左下角 (0,0) 有可能正好落在缺口里，此时
+        "已放件右上角"一个点都还没有，搜索就只剩一个无效候选、整批件排不上。
+        轮廓顶点天然是可行的左下角（例如缺口右侧、上方竖边的底端），再补上
+        "顶到左边"与"压到底边"两条投影。多给的候选一律由 _check 复验，不存在误放。
+        """
+        boundary = self.state.boundary
+        if boundary is None:
+            return []
+        rows = boundary.tolist() if hasattr(boundary, "tolist") else list(boundary)
+        # 1mm 网格去重：布尔差的圆弧近似会吐出上百个近邻点，它们对落脚没区别。
+        # 关键：网格只当"去重键"，坐标一律保留原值 —— 把点四舍五入易位，
+        # 圆弧上的点就可能被挪进缺口里，得到一个看着贴边、实际越界 1mm² 的候选
+        picked: Dict[Tuple[float, float], Tuple[float, float]] = {}
+        for grid in (1.0, 4.0, 10.0):
+            picked = {}
+            for item in rows:
+                bx, by = float(item[0]), float(item[1])
+                picked.setdefault((round(bx / grid), round(by / grid)), (bx, by))
+            if len(picked) * 3 <= self.MAX_BOUNDARY_CANDIDATES:
+                break
+        points = set()
+        for bx, by in picked.values():
+            points.add((bx, by))
+            points.add((margin, by))
+            points.add((bx, margin))
+        return sorted(points, key=lambda item: (item[1], item[0]))
 
     def _rotations(self, task: PartTask) -> List[float]:
         """可用角度：木纹锁定只保留当前角；关闭旋转则保持现有姿方向。"""
@@ -305,15 +342,16 @@ def auto_nest_job(params: Dict[str, Any], report: Any) -> Dict[str, Any]:
                               locked=False, zorder=index,
                               fixed_rot=placement.fixed_rot)
 
-        margin = float(sheet["margin"])
-        park_x, park_y, park_row_h = margin, float(sheet["height"]) + margin, 0.0
+        # 停靠口径与 LayoutService.park_outside 完全一致：左端贴 0，上边留 PARK_OFFSET，
+        # 同一批"未排下"的件不管是自动排料挪的还是复位挪的，位置都一样
+        park_x, park_y, park_row_h = 0.0, float(sheet["height"]) + PARK_OFFSET, 0.0
         park_index = 0
         for task in tasks:
             if task.part.id not in unplaced_ids:
                 continue
             width, height = task.part.size_at(task.rot)
-            if park_x + width > float(sheet["width"]) - margin and park_row_h > 0:
-                park_x = margin
+            if park_row_h > 0 and park_x + width > max(float(sheet["width"]), width):
+                park_x = 0.0
                 park_y += park_row_h + gap
                 park_row_h = 0.0
             db.save_placement(conn, project_id, task.part.id, 0,

@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 LOG_MIN_INTERVAL = 1.5      # 秒
 LOG_MIN_STEP = 0.08         # 进度 8%
 
+# 任务表保留上限：连续排料/刀路时 _tasks 只增不减，长跑会把内存吃满。
+# 只淘汰最早的已完成记录（排队/运行中的永不淘汰），前端事后查状态最多丢旧记录。
+MAX_TASK_RECORDS = 400
+
 
 # ---------------------------------------------------------------- 异常
 class TaskCancelled(Exception):
@@ -157,6 +161,7 @@ class TaskQueue:
         task_id = uuid.uuid4().hex[:12]
         info = TaskInfo(id=task_id, kind=kind, project_id=project_id)
         self._tasks[task_id] = info
+        self._prune_tasks()
         self._cancel_flags[task_id] = {"cancelled": False}
 
         db.record_task(task_id, project_id, kind, "queued")
@@ -178,6 +183,20 @@ class TaskQueue:
 
     def all_tasks(self) -> Dict[str, TaskInfo]:
         return dict(self._tasks)
+
+    def _prune_tasks(self) -> None:
+        """超出保留上限时淘汰最早的已完成任务（只动内存，不动 task 表）。"""
+        overflow = len(self._tasks) - MAX_TASK_RECORDS
+        if overflow <= 0:
+            return
+        for task_id in list(self._tasks):
+            if overflow <= 0:
+                break
+            info = self._tasks.get(task_id)
+            if info is None or info.status in ("queued", "running"):
+                continue
+            self._tasks.pop(task_id, None)
+            overflow -= 1
 
     # ------------------------------------------------------------ worker
     async def _worker_loop(self, index: int) -> None:

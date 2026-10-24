@@ -16,6 +16,7 @@ from app.models import db
 from app.models.schemas import HealthResponse
 from app.services import geometry_service, tool_service
 from app.services.nesting_service import get_nester
+from app.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ async def health() -> HealthResponse:
     nester = get_nester(settings.nesting_engine)
     return HealthResponse(
         status="ok",
-        version="0.1.0",
+        version=__version__,
         geometryEngine=getattr(geometry, "name", "unknown"),
         nestingEngine=getattr(nester, "name", "unknown"),
         clients=hub.client_count,

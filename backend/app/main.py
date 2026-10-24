@@ -22,8 +22,10 @@ from app.api import (
     routes_import,
     routes_layout,
     routes_logs,
+    routes_mes,
     routes_post,
     routes_project,
+    routes_scrap,
     routes_tools,
     routes_workorders,
     ws,
@@ -36,6 +38,7 @@ from app.core.tasks import task_queue
 from app.geometry.base import get_engine
 from app.models import db
 from app.post import registry as post_registry
+from app.version import EDITION, __version__
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     setup_logging(settings.log_level, settings.data_dir / "logs", settings.log_buffer)
+    logger.info("%s %s（%s）启动", "BtCAM", __version__, EDITION)
     logger.info("数据目录: %s", settings.data_dir)
 
     db.init_db()
@@ -67,7 +71,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="BtCAM Backend",
-        version="0.1.0",
+        version=__version__,
         description="2D 切割 CAM 计算服务：OCCT 几何 + 排料 + 刀路",
         lifespan=lifespan,
     )
@@ -86,6 +90,9 @@ def create_app() -> FastAPI:
     app.include_router(routes_tools.router)
     app.include_router(routes_post.router)
     app.include_router(routes_workorders.router)
+    app.include_router(routes_scrap.router)
+    # 模块 12：MES 对接是可选件，没配置时所有 /api/mes/* 调用只会回“未启用”
+    app.include_router(routes_mes.router)
     app.include_router(routes_logs.router)
     app.include_router(ws.router)
 

@@ -263,6 +263,19 @@ def _sum_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return total
 
 
+def _notify_mes(project_id: int, order_id: int) -> None:
+    """MES 自动回传旁路（模块 12）。
+
+    延迟 import + 整体 try/except：MES 未启用、断网、配置错都只是"没推送"，
+    绝不影响导出接口的返回值与耗时（真正的网络请求在 daemon 线程里）。
+    """
+    try:
+        from app.mes import service as mes_service
+        mes_service.auto_push(project_id, order_id)
+    except Exception:
+        logger.debug("MES 自动推送旁路异常（已忽略）", exc_info=True)
+
+
 @router.post("/export")
 async def export(req: ExportRequest) -> Dict[str, Any]:
     """同步导出：刀路文本或 DXF 图纸；`allSheets` 时每块板一个文件。"""
@@ -277,9 +290,13 @@ async def export(req: ExportRequest) -> Dict[str, Any]:
             with db.get_conn() as conn:
                 count = work_order_service.add_export_files(
                     conn, project_id, int(req.workOrderId), result.get("files") or [])
-            logger.info("工单 #%s 登记加工文件 %d 个", req.workOrderId, count)
+            logger.info("工单 #%s 登记加工文件 %d 个（工程 #%s · 后处理 %s）",
+                        req.workOrderId, count, project_id, processor.get("id"))
         except Exception:
-            logger.warning("工单加工文件登记失败（#%s）", req.workOrderId, exc_info=True)
+            logger.warning("工单加工文件登记失败（工单 #%s · 工程 #%s）",
+                           req.workOrderId, project_id, exc_info=True)
+        # 模块 12：导出成功后触发 MES 自动回传（已启用 + autoPush + 编号对得上才生效）
+        _notify_mes(project_id, int(req.workOrderId))
 
     # DXF 导出的是工程图形，与刀路参数无关，也不按板材拆分
     if str(processor.get("kind")) == "dxf":
@@ -305,7 +322,9 @@ async def export(req: ExportRequest) -> Dict[str, Any]:
         except HTTPException:
             raise
         except Exception as exc:
-            logger.exception("DXF 导出失败")
+            logger.exception("DXF 导出失败：工程 #%s · 后处理 %s · 工单 %s",
+                             project_id, processor.get("id"),
+                             req.workOrderId or "-")
             raise HTTPException(500, "DXF 导出失败: %s" % exc) from exc
 
     def _do() -> Dict[str, Any]:
@@ -348,7 +367,9 @@ async def export(req: ExportRequest) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("导出失败")
+        logger.exception("刀路导出失败：工程 #%s · 后处理 %s · 工单 %s · 板 %s%s",
+                         project_id, processor.get("id"), req.workOrderId or "-",
+                         req.sheetIndex, "（全板）" if req.allSheets else "")
         raise HTTPException(500, f"导出失败: {exc}") from exc
 
     def _register() -> None:

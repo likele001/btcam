@@ -40,6 +40,8 @@ LAYOUT_POLY_BASE = 200_000
 EPS = 1e-6
 # 判定"真重叠"的最小面积（mm²），避免相切被误判
 MIN_OVERLAP_AREA = 1e-3
+# 停靠件与板材上边界的距离（mm）：留一条缝，前端画出来不会和板框粘在一起
+PARK_OFFSET = 10.0
 
 
 # ---------------------------------------------------------------- 数据结构
@@ -133,6 +135,11 @@ class LayoutState:
     sheet: Dict[str, float]
     parts: List[LayoutPart] = field(default_factory=list)
     placements: Dict[int, Placement] = field(default_factory=dict)
+    # 余料边界（模块 10）：None = 规则矩形板；否则为闭合多边形（板材坐标）。
+    # 边界属于“几何约束”，所以留在后端校验，前端只拿轮廓来绘制
+    boundary: Optional[np.ndarray] = None
+    # 余料元信息（id / 名称 / 尺寸），仅用于下发与界面展示
+    scrap: Optional[Dict[str, Any]] = None
 
     def part(self, part_id: int) -> Optional[LayoutPart]:
         return next((p for p in self.parts if p.id == part_id), None)
@@ -163,6 +170,29 @@ class LayoutService:
     def load(self, conn: Any, project_id: int) -> LayoutState:
         """从数据库组装排料上下文（轮廓归一化、摆放状态原样读出）。"""
         sheet = db.load_sheet(conn, project_id)
+        # 模块 10：排料板绑定了余料时，真正的边界是那块料的轮廓。
+        # 余料被删掉了就地解绑，避免拿着幽灵轮廓继续做越界判定
+        boundary: Optional[np.ndarray] = None
+        scrap: Optional[Dict[str, Any]] = None
+        if int(sheet.get("scrapId") or 0):
+            row = db.load_scrap(conn, project_id, int(sheet["scrapId"]))
+            if row is None:
+                db.set_sheet_scrap(conn, project_id, 0)
+                sheet["scrapId"] = 0
+            else:
+                boundary = np.asarray(row["outline"], dtype=np.float64)
+                scrap = {
+                    "id": int(row["id"]),
+                    "name": str(row["name"]),
+                    "code": str(row["code"]),
+                    "material": str(row["material"]),
+                    "thickness": float(row["thickness"]),
+                    "width": float(row["width"]),
+                    "height": float(row["height"]),
+                    "area": float(row["area"]),
+                    "outline": row["outline"],
+                }
+
         raw_parts = db.load_parts(conn, project_id)
         rows = db.load_polylines(conn, project_id)
         placements = {pid: Placement(
@@ -190,7 +220,7 @@ class LayoutService:
         placements = {pid: p for pid, p in placements.items() if pid in known}
 
         return LayoutState(project_id=project_id, sheet=sheet, parts=parts,
-                           placements=placements)
+                           placements=placements, boundary=boundary, scrap=scrap)
 
     @staticmethod
     def _make_part(part_id: int, name: str, items: Sequence[Dict[str, Any]]) -> Optional[LayoutPart]:
@@ -272,6 +302,13 @@ class LayoutService:
             return LayoutResult(False, "余量与间距不能为负数", self.load(conn, project_id))
         if width - 2 * margin <= 0 or height - 2 * margin <= 0:
             return LayoutResult(False, "四边余量之和超过板材尺寸", self.load(conn, project_id))
+
+        # 模块 10：手改了宽高就不再是那块余料了（轮廓对不上），自动解绑退回矩形板
+        before = db.load_sheet(conn, project_id)
+        if int(before.get("scrapId") or 0) and (
+                abs(float(before["width"]) - width) > 0.5
+                or abs(float(before["height"]) - height) > 0.5):
+            db.set_sheet_scrap(conn, project_id, 0)
 
         db.save_sheet(conn, project_id, {"width": width, "height": height,
                                          "margin": margin, "gap": gap})
@@ -373,10 +410,81 @@ class LayoutService:
         return LayoutResult(True, "", state)
 
     def reset(self, conn: Any, project_id: int) -> LayoutResult:
-        """清空摆放并重新做一次初始行排。"""
+        """清空摆放并重新做一次初始行排。
+
+        模块 10：板材是余料时，行排只认矩形包围盒，结果会落进余料的缺口
+        （矩形里有、轮廓里没有）。这里补一次停靠，保证"看得见的位置就是切得到的位置"。
+        """
         db.clear_placements(conn, project_id)
         state = self.open(conn, project_id)
+        if self.park_outside(conn, project_id, state, check_gap=False):
+            # 停靠只写了库，内存里的摆放已经过期，重新读一次再下发
+            state = self.load(conn, project_id)
+        logger.info("排料复位：%d 个零件，板材 %.0f×%.0f",
+                    len(state.parts), float(state.sheet["width"]),
+                    float(state.sheet["height"]))
         return LayoutResult(True, "", state)
+
+    def park_outside(self, conn: Any, project_id: int, state: LayoutState,
+                     check_gap: bool = True) -> int:
+        """把放不到当前板材边界内的零件停靠到板外上方，返回停靠件数。
+
+        与自动排料的"未排下"口径一致：不删零件、不静默改位置，而是挪到板上方一行，
+        用户一眼能看出这块料放不下它。只在绑定余料时生效（矩形板不搬动零件，
+        越界件继续留在板上并在 stats 里报 overflow）。
+
+        check_gap=True 时连带判最小间距（换余料板时旧摆放可能贴得过近）；
+        复位重排是新做的行排，只判"矩形板框 + 余料轮廓"，避免把间距问题也当放不下。
+        """
+        if state.boundary is None:
+            return 0
+        sheet_w = float(state.sheet["width"])
+        gap = float(state.sheet["gap"])
+        park_x = 0.0
+        park_y = float(state.sheet["height"]) + PARK_OFFSET
+        row_h = 0.0
+        parked = 0
+        zorder = len(state.placements)
+        for part in state.parts:
+            placement = state.placements.get(part.id)
+            if placement is None:
+                continue
+            if check_gap:
+                error = self._check(state, part, placement.rot, placement.tx,
+                                    placement.ty, exclude=part.id)
+                if not error:
+                    continue
+            elif not self._outside_boundary(state, part, placement.rot,
+                                            placement.tx, placement.ty):
+                continue
+            width, height = part.size_at(placement.rot)
+            if row_h > 0 and park_x + width > max(sheet_w, width):
+                park_x = 0.0
+                park_y += row_h + gap
+                row_h = 0.0
+            db.save_placement(conn, project_id, part.id, 0,
+                              round(park_x, 3), round(park_y, 3), placement.rot,
+                              locked=False, zorder=zorder + parked,
+                              fixed_rot=placement.fixed_rot)
+            park_x += width + gap
+            row_h = max(row_h, height)
+            parked += 1
+        if parked:
+            logger.info("有 %d 个零件放不进当前余料轮廓，已停靠到板外上方", parked)
+        return parked
+
+    def _outside_boundary(self, state: LayoutState, part: LayoutPart, rot: float,
+                          tx: float, ty: float) -> bool:
+        """只判"矩形板框 + 余料轮廓"是否放不下，不考虑与其它零件的间距。"""
+        margin = float(state.sheet["margin"])
+        w, h = part.size_at(rot)
+        if (tx < margin - EPS or ty < margin - EPS
+                or tx + w > float(state.sheet["width"]) - margin + EPS
+                or ty + h > float(state.sheet["height"]) - margin + EPS):
+            return True
+        if state.boundary is None:
+            return False
+        return not self._inside(state.boundary, part.rotated_outline(rot, tx, ty))
 
     # ------------------------------------------------------------ 校验
     def _check(self, state: LayoutState, part: LayoutPart, rot: float,
@@ -397,6 +505,11 @@ class LayoutService:
             return f"零件「{part.name}」超出板材上边界（可用高度 {top - margin:.1f}mm）"
 
         outline = part.rotated_outline(rot, tx, ty)
+        # 模块 10：当前板材是余料时，零件还必须整个落在余料轮廓内。
+        # 矩形板框只是余料的包围盒，凹进去的部分不能用
+        if state.boundary is not None and not self._inside(state.boundary, outline):
+            return f"零件「{part.name}」超出余料轮廓（请放到余料范围内）"
+
         box = (min(float(outline[:, 0].min()), tx), min(float(outline[:, 1].min()), ty),
                max(float(outline[:, 0].max()), tx + w), max(float(outline[:, 1].max()), ty + h))
 
@@ -417,6 +530,50 @@ class LayoutService:
             if self._overlaps(outline, other_outline, gap):
                 return f"零件「{part.name}」与「{other.name}」间距不足 {gap:g}mm"
         return ""
+
+    def _inside(self, boundary: np.ndarray, outline: np.ndarray) -> bool:
+        """轮廓是否完整落在余料边界内（模块 10）。
+
+        做法：两者求交，交面积等于轮廓自身面积才说明没有一丝跑到边界外。
+        比“顶点逐个判断”稳：凹多边形里顶点全在内、但某条边跨出去的情况也能拦住。
+        """
+        pc = self._pc
+        part_area = abs(self._signed_area(outline))
+        if part_area <= 0:
+            return False
+        if pc is None:                      # 没有 clipper：退化为顶点包含性判定
+            poly = boundary.tolist()
+            return all(self._point_in_polygon(float(x), float(y), poly) for x, y in outline)
+        try:
+            clipper = pc.Pyclipper()
+            clipper.AddPath(self._to_path(boundary), pc.PT_SUBJECT, True)
+            clipper.AddPath(self._to_path(outline), pc.PT_CLIP, True)
+            solution = clipper.Execute(pc.CT_INTERSECTION, pc.PFT_NONZERO, pc.PFT_NONZERO)
+            inside = sum(abs(pc.Area(path)) for path in solution) / (SCALE * SCALE)
+            return inside >= part_area - 1.0     # 1mm² 容差：浮点与圆角外扩的余量
+        except Exception:                    # 退化轮廓不应让拖拽崩掉，按“超出”拒绝
+            logger.warning("余料边界判定失败，按超出处理", exc_info=True)
+            return False
+
+    @staticmethod
+    def _to_path(pts: np.ndarray) -> List[Tuple[int, int]]:
+        """ndarray -> pyclipper 定点路径。"""
+        return [(int(round(float(x) * SCALE)), int(round(float(y) * SCALE)))
+                for x, y in pts]
+
+    @staticmethod
+    def _point_in_polygon(x: float, y: float, poly: List[Any]) -> bool:
+        """射线法（clipper 缺失时的兜底）。"""
+        inside = False
+        count = len(poly)
+        for index in range(count):
+            x1, y1 = float(poly[index][0]), float(poly[index][1])
+            x2, y2 = float(poly[(index + 1) % count][0]), float(poly[(index + 1) % count][1])
+            if (y1 > y) != (y2 > y):
+                cross = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+                if x < cross:
+                    inside = not inside
+        return inside
 
     def _overlaps(self, a: np.ndarray, b: np.ndarray, gap: float) -> bool:
         """两个多边形在留出 gap 间距后是否冲突。
@@ -478,20 +635,19 @@ class LayoutService:
         used_area = sum(part.area for part in state.parts if part.id in state.placements)
         margin = float(state.sheet["margin"])
 
-        overflow = 0
-        for part in state.parts:
-            placement = state.placements.get(part.id)
-            if placement is None:
-                continue
-            w, h = part.size_at(placement.rot)
-            if (placement.tx < margin - EPS or placement.ty < margin - EPS
-                    or placement.tx + w > float(state.sheet["width"]) - margin + EPS
-                    or placement.ty + h > float(state.sheet["height"]) - margin + EPS):
-                overflow += 1
+        # 越界 = 超出矩形板框 **或** 落在余料轮廓外（模块 10）
+        overflow = sum(
+            1 for part in state.parts
+            if part.id in state.placements and self._outside_boundary(
+                state, part, state.placements[part.id].rot,
+                state.placements[part.id].tx, state.placements[part.id].ty)
+        )
 
         return {
             "projectId": state.project_id,
             "sheet": {k: round(float(v), 3) for k, v in state.sheet.items()},
+            # 模块 10：余料作为板材时下发轮廓，前端照此画边界（不再画矩形）
+            "scrap": state.scrap,
             "parts": [
                 {
                     "id": part.id,
@@ -521,6 +677,9 @@ class LayoutService:
                 "sheetHeight": round(float(state.sheet["height"]), 3),
                 "gap": round(float(state.sheet["gap"]), 3),
                 "margin": round(margin, 3),
+                "scrapId": int(state.sheet.get("scrapId") or 0),
+                "boundaryArea": round(float(abs(self._signed_area(state.boundary))), 1)
+                if state.boundary is not None else round(sheet_area, 1),
             },
         }
 

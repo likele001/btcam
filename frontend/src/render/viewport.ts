@@ -294,7 +294,20 @@ export class CanvasController {
     if (width <= 0 || height <= 0) return;
     const line = 1 / Math.max(this.camera.scale, 1e-6);
 
-    // 板面底色（比背景略亮，区分“板内/板外”）
+    // 模块 10：板材是余料时，真实可用区是那块料的轮廓（可能带缺口），
+    // 不能画成矩形——用户得一眼看出哪块区域不能用。
+    const scrap = this.layout?.scrap ?? null;
+    if (scrap && scrap.outline.length >= 3) {
+      const points = scrap.outline.flatMap(([x, y]) => [x, y]);
+      // 余料面（填充与描边分开两次提交，与下面的矩形写法一致）
+      g.poly(points).fill({ color: 0x0f1319, alpha: 1 });
+      g.poly(points).stroke({ width: line * 2, color: 0x4fa3ff, alpha: 0.9 });
+      // 包围盒只做淡色参考线：方便看出余料是不是歪料/带缺角
+      g.rect(0, 0, width, height).stroke({ width: line, color: 0x4fa3ff, alpha: 0.18 });
+      return;
+    }
+
+    // 板面底色（比背景略亮，区分“板内/板外”），矩形整板路径
     g.rect(0, 0, width, height).fill({ color: 0x0f1319, alpha: 1 });
     // 板边
     g.rect(0, 0, width, height).stroke({ width: line * 2, color: 0x4fa3ff, alpha: 0.9 });

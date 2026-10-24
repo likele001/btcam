@@ -32,6 +32,11 @@ router = APIRouter()
 # 单个 WS 消息上限（排料结果最大也就几十 MB）
 MAX_FRAME_BYTES = 256 * 1024 * 1024
 
+# 空闲超时（秒）：前端每 15s 发一次 PING，这里 90s 收不到任何帧就判定连接已死。
+# 不设超时的话，拔网线/休眠/程序崩溃这类半开连接收不到 FIN，receive 永远阻塞，
+# 连接会一直挂在 hub 里，每次广播都往死套接字写一遍，越积越慢。
+IDLE_TIMEOUT_SEC = 90.0
+
 
 def build_document_frame(project_id: Optional[int] = None,
                          extra: Optional[dict] = None) -> tuple:
@@ -124,7 +129,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     try:
         while True:
-            data = await websocket.receive_bytes()
+            try:
+                data = await asyncio.wait_for(websocket.receive_bytes(),
+                                              timeout=IDLE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning("WS 空闲超时（%.0fs 无心跳），主动断开；当前连接数=%d",
+                               IDLE_TIMEOUT_SEC, hub.client_count)
+                await websocket.close(code=1001, reason="idle timeout")
+                break
+            except WebSocketDisconnect:
+                raise
             if len(data) > MAX_FRAME_BYTES:
                 await hub.send_frame(websocket, MsgType.ERROR, {"message": "帧过大"})
                 continue

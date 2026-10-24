@@ -417,6 +417,17 @@ def open_order(conn, project_id: int, order_id: int) -> Dict[str, Any]:
             "gap": float(sheet.get("gap", 5.0)),
         })
 
+    # 模块 10：余料绑定也要写回，否则打开旧工单会丢掉"这块料是余料"的语义；
+    # 余料被删了就只能退回整板，并在 missing 里明确告知，不静默改成矩形板。
+    scrap_missing = ""
+    scrap_id = int(sheet.get("scrapId") or 0)
+    if scrap_id and db.load_scrap(conn, project_id, scrap_id) is not None:
+        db.set_sheet_scrap(conn, project_id, scrap_id)
+    else:
+        db.set_sheet_scrap(conn, project_id, 0)
+        if scrap_id:
+            scrap_missing = "余料 #%d 已不在余料库，板材退回整板" % scrap_id
+
     # 摆放：part_id 重映射；旧版本快照没存 part_id 时按采集顺序兜底
     for index, placement in enumerate(snapshot.get("placements") or []):
         new_id = part_map.get(int(placement.get("partId") or -1)) or order_map.get(index)
@@ -433,7 +444,7 @@ def open_order(conn, project_id: int, order_id: int) -> Dict[str, Any]:
 
     detail = _detail(conn, row)
     toolpath = dict(detail["toolpath"] or {})
-    missing: List[str] = []
+    missing: List[str] = [scrap_missing] if scrap_missing else []
 
     tool = detail.get("tool") or {}
     if tool.get("id"):

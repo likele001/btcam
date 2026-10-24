@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 
 from app.config import settings
+from app.version import SCHEMA_VERSION
 
 # ---------------------------------------------------------------- 建表
 SCHEMA = """
@@ -135,6 +136,8 @@ CREATE TABLE IF NOT EXISTS layout_sheet (
     height      REAL NOT NULL DEFAULT 2440.0,
     margin      REAL NOT NULL DEFAULT 10.0,   -- 四边预留余量
     gap         REAL NOT NULL DEFAULT 5.0,    -- 零件最小间距
+    -- 模块 10：绑定的余料 id（0 = 规则整板）；非 0 时轮廓才是真正的板材边界
+    scrap_id    INTEGER NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL
 );
 
@@ -181,6 +184,63 @@ CREATE TABLE IF NOT EXISTS work_order_file ( -- 加工文件归档（导出时�
     created_at  REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_workorder_file ON work_order_file(order_id);
+
+-- 余料库（模块 10）：一次排板切割后剩下的料。
+-- outline 存 JSON 多边形，坐标相对**自身包围盒左下角**（与板材坐标同构）；
+-- width/height/area 由后端从轮廓算出并冗余存储，列表页不必解析轮廓。
+CREATE TABLE IF NOT EXISTS scrap (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    name            TEXT    NOT NULL,
+    code            TEXT    NOT NULL DEFAULT '',   -- 余料编号（贴标签/扫码）
+    material        TEXT    NOT NULL DEFAULT '',
+    thickness       REAL    NOT NULL DEFAULT 0.0,
+    width           REAL    NOT NULL,              -- 包围盒宽 mm
+    height          REAL    NOT NULL,              -- 包围盒高 mm
+    area            REAL    NOT NULL DEFAULT 0.0,  -- 轮廓净面积 mm²
+    outline         TEXT    NOT NULL,              -- JSON [[x,y],...]
+    source          TEXT    NOT NULL DEFAULT 'manual', -- manual | layout
+    source_order_id INTEGER NOT NULL DEFAULT 0,
+    note            TEXT    NOT NULL DEFAULT '',
+    created_at      REAL    NOT NULL,
+    updated_at      REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scrap_project ON scrap(project_id);
+
+-- MES 工单缓存（模块 12）：从 MES 拉回来的单，按 remote_id 幂等 upsert。
+-- project_id 只记录"哪张单是哪次拉进哪个工程的"，列表是全局的：
+-- 同一张 MES 单在多个工程里被拉过仍然只有一行，避免重复归档。
+CREATE TABLE IF NOT EXISTS mes_order (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL DEFAULT 0,
+    remote_id   TEXT    NOT NULL,                 -- MES 单号
+    name        TEXT    NOT NULL DEFAULT '',
+    customer    TEXT    NOT NULL DEFAULT '',
+    material    TEXT    NOT NULL DEFAULT '',
+    thickness   REAL    NOT NULL DEFAULT 0.0,
+    due_date    TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'pulled', -- pulled 待推送 | archived 已归档
+    part_count  INTEGER NOT NULL DEFAULT 0,
+    parts       TEXT    NOT NULL DEFAULT '[]',     -- JSON 零件清单（已归一化）
+    payload     TEXT    NOT NULL DEFAULT '{}',     -- 原始响应，排障用
+    pulled_at   REAL    NOT NULL,
+    archived_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mes_order_remote ON mes_order(remote_id);
+
+-- MES 交互日志：测试连接 / 拉单 / 回传各一条，含尝试次数与状态码
+-- （表名沿用旧版的 mes_push_log，升上来的库里已有历史记录）
+CREATE TABLE IF NOT EXISTS mes_push_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    INTEGER NOT NULL DEFAULT 0,
+    action      TEXT    NOT NULL DEFAULT '',
+    ok          INTEGER NOT NULL DEFAULT 0,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    status_code INTEGER NOT NULL DEFAULT 0,
+    message     TEXT    NOT NULL DEFAULT '',
+    created_at  REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mes_push_log_order ON mes_push_log(order_id);
 """
 
 
@@ -251,6 +311,65 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "fixed_rot" not in placement_columns:
         conn.execute("ALTER TABLE layout_placement ADD COLUMN fixed_rot INTEGER NOT NULL DEFAULT 0")
 
+    # 模块10 新增：排料板可绑定一块余料（旧库升级时补列，默认 0 = 整板）
+    sheet_columns = {row["name"] for row in conn.execute("PRAGMA table_info(layout_sheet)")}
+    if "scrap_id" not in sheet_columns:
+        conn.execute("ALTER TABLE layout_sheet ADD COLUMN scrap_id INTEGER NOT NULL DEFAULT 0")
+
+    # 模块12：旧版 mes_order 只有 parts JSON，没有冗余的 part_count。
+    # 补列后用零件数量回填一次，列表页不必为了显示件数去解 JSON。
+    mes_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mes_order)")}
+    if mes_columns and "part_count" not in mes_columns:
+        conn.execute("ALTER TABLE mes_order ADD COLUMN part_count INTEGER NOT NULL DEFAULT 0")
+        for row in conn.execute("SELECT id, parts FROM mes_order").fetchall():
+            try:
+                parts = json.loads(row["parts"] or "[]")
+            except (TypeError, ValueError):
+                parts = []
+            total = 0
+            if isinstance(parts, list):
+                for item in parts:
+                    total += int(item.get("qty") or 1) if isinstance(item, dict) else 1
+            conn.execute("UPDATE mes_order SET part_count = ? WHERE id = ?",
+                         (total, int(row["id"])))
+
+    # 模块10 余料表：早期版本用过“多环 rings + 使用状态 status”一套字段，
+    # 现在改成“单轮廓 + 尺寸冗余”。SQLite 不能删列，而且旧的 rings 是 NOT NULL
+    # 又没有默认值，直接插新行会失败，所以这里做一次整表重建（按 id 保留数据）。
+    scrap_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scrap)")}
+    if scrap_columns and "outline" not in scrap_columns:
+        # 上次升级中断可能留下临时表，先清掉再重建（迁移必须可反复执行）
+        conn.execute("DROP TABLE IF EXISTS scrap_upgrade")
+        legacy = (conn.execute("SELECT id, rings FROM scrap").fetchall()
+                  if "rings" in scrap_columns else [])
+        conn.execute(
+            "CREATE TABLE scrap_upgrade ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,"
+            " name TEXT NOT NULL, code TEXT NOT NULL DEFAULT '',"
+            " material TEXT NOT NULL DEFAULT '', thickness REAL NOT NULL DEFAULT 0.0,"
+            " width REAL NOT NULL, height REAL NOT NULL, area REAL NOT NULL DEFAULT 0.0,"
+            " outline TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'manual',"
+            " source_order_id INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+        )
+        # 旧库里可能有指向已删除工程的孤儿行，新表带外键，留下来反而会拖垮启动
+        conn.execute(
+            "INSERT INTO scrap_upgrade(id, project_id, name, code, material, thickness,"
+            " width, height, area, outline, source, source_order_id, note, created_at, updated_at)"
+            " SELECT id, project_id, name, '', COALESCE(material, ''), COALESCE(thickness, 0),"
+            " width, height, COALESCE(area, 0), '[]', COALESCE(source, 'manual'),"
+            " COALESCE(source_order_id, 0), COALESCE(note, ''), created_at, created_at FROM scrap"
+            " WHERE project_id IN (SELECT id FROM project)"
+        )
+        conn.execute("DROP TABLE scrap")
+        conn.execute("ALTER TABLE scrap_upgrade RENAME TO scrap")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scrap_project ON scrap(project_id)")
+        for row in legacy:
+            outline = _outline_from_rings(row["rings"])
+            if outline:
+                conn.execute("UPDATE scrap SET outline = ? WHERE id = ?", (outline, row["id"]))
+
     # 模块6 新增：刀具库字段（旧库只有 name/diameter/tool_type/feed/...）
     tool_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tool)")}
     for name, ddl in (
@@ -266,6 +385,73 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ):
         if name not in tool_columns:
             conn.execute("ALTER TABLE tool ADD COLUMN %s %s" % (name, ddl))
+
+    _migrate_work_order(conn)
+
+    # 结构版本标记：排障时能一眼看出这个库被哪一版程序迁移过，
+    # 与发布版本解耦（只在本函数新增迁移步骤时才 +1）
+    set_setting(conn, "schema.version", str(SCHEMA_VERSION))
+    set_setting(conn, "schema.migrated_at", "%.0f" % time.time())
+
+
+def _migrate_work_order(conn: sqlite3.Connection) -> None:
+    """工单存档（模块 8）旧库升级。
+
+    早期版本的 work_order 只有 name/snapshot/created_at，检索用的 code/note、
+    列表排序用的 updated_at、以及冗余统计 stats 都是后加的；work_order_file
+    也只存了 path。`_summary()` 是直接下标取列的，缺列会抛 KeyError，
+    所以这里必须补齐，保证老工单打开不报错、列表能正常显示件数。
+    """
+    order_columns = {row["name"] for row in conn.execute("PRAGMA table_info(work_order)")}
+    if order_columns:
+        added_stats = False
+        for name, ddl in (
+            ("code", "TEXT NOT NULL DEFAULT ''"),
+            ("note", "TEXT NOT NULL DEFAULT ''"),
+            ("stats", "TEXT NOT NULL DEFAULT '{}'"),
+            ("updated_at", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name not in order_columns:
+                conn.execute("ALTER TABLE work_order ADD COLUMN %s %s" % (name, ddl))
+                if name == "stats":
+                    added_stats = True
+
+        # 只在真正补了 stats 列时回填一次，避免每次启动都扫全表：
+        # 老快照把统计埋在 JSON 的 stats 段里，提到列上列表页才能直接读
+        if added_stats:
+            for row in conn.execute("SELECT id, snapshot FROM work_order").fetchall():
+                stats = _stats_from_snapshot(row["snapshot"])
+                if stats:
+                    conn.execute(
+                        "UPDATE work_order SET stats = ? WHERE id = ?",
+                        (json.dumps(stats, ensure_ascii=False), int(row["id"])),
+                    )
+
+        # updated_at 默认 0 会让列表显示 1970 年，用创建时间兜底
+        conn.execute("UPDATE work_order SET updated_at = created_at WHERE updated_at <= 0")
+
+    file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(work_order_file)")}
+    if file_columns:
+        for name, ddl in (
+            ("format", "TEXT NOT NULL DEFAULT ''"),
+            ("processor", "TEXT NOT NULL DEFAULT ''"),
+            ("bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("sheet_index", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in file_columns:
+                conn.execute("ALTER TABLE work_order_file ADD COLUMN %s %s" % (name, ddl))
+
+
+def _stats_from_snapshot(snapshot: Any) -> Dict[str, Any]:
+    """从旧工单快照里取出统计段（早期只把它嵌在快照 JSON 里）。"""
+    try:
+        payload = json.loads(snapshot or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    stats = payload.get("stats")
+    return stats if isinstance(stats, dict) and stats else {}
 
 
 # ---------------------------------------------------------------- 刀具库（模块 6）
@@ -502,15 +688,21 @@ def ensure_layer(conn: sqlite3.Connection, project_id: int, name: str,
 
 # ---------------------------------------------------------------- 排料（模块 3）
 def load_sheet(conn: sqlite3.Connection, project_id: int) -> Dict[str, Any]:
-    """读板材参数；没有记录时返回默认值（不落库，由 save_sheet 决定何时固化）。"""
+    """读板材参数；没有记录时返回默认值（不落库，由 save_sheet 决定何时固化）。
+
+    `scrapId` 非 0 表示当前板材是余料库里的某块余料，轮廓由余料服务提供，
+    这里只带出 id，避免排料服务反向依赖余料模块。
+    """
     row = conn.execute(
-        "SELECT width, height, margin, gap FROM layout_sheet WHERE project_id = ?",
+        "SELECT width, height, margin, gap, scrap_id FROM layout_sheet WHERE project_id = ?",
         (project_id,),
     ).fetchone()
     if row is None:
-        return {"width": 1220.0, "height": 2440.0, "margin": 10.0, "gap": 5.0}
+        return {"width": 1220.0, "height": 2440.0, "margin": 10.0, "gap": 5.0,
+                "scrapId": 0}
     return {"width": float(row["width"]), "height": float(row["height"]),
-            "margin": float(row["margin"]), "gap": float(row["gap"])}
+            "margin": float(row["margin"]), "gap": float(row["gap"]),
+            "scrapId": int(row["scrap_id"] or 0)}
 
 
 def save_sheet(conn: sqlite3.Connection, project_id: int, sheet: Dict[str, float]) -> None:
@@ -521,6 +713,18 @@ def save_sheet(conn: sqlite3.Connection, project_id: int, sheet: Dict[str, float
         " margin=excluded.margin, gap=excluded.gap, updated_at=excluded.updated_at",
         (project_id, float(sheet["width"]), float(sheet["height"]),
          float(sheet["margin"]), float(sheet["gap"]), time.time()),
+    )
+
+
+def set_sheet_scrap(conn: sqlite3.Connection, project_id: int, scrap_id: int) -> None:
+    """绑定/解绑排料板的余料（0 = 规则整板）。
+
+    只改 scrap_id，不动宽高：调用方（scrap_service.apply_to_sheet）负责先写尺寸。
+    余料被删除时排料服务会调这里解绑，避免留下指向不存在轮廓的幽灵边界。
+    """
+    conn.execute(
+        "UPDATE layout_sheet SET scrap_id = ?, updated_at = ? WHERE project_id = ?",
+        (int(scrap_id), time.time(), project_id),
     )
 
 
@@ -559,6 +763,21 @@ def save_placement(conn: sqlite3.Connection, project_id: int, part_id: int,
 
 def clear_placements(conn: sqlite3.Connection, project_id: int) -> None:
     conn.execute("DELETE FROM layout_placement WHERE project_id = ?", (project_id,))
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """读一条应用配置（app_setting 是 key/value 表，模块 12 用它存 mes.config）。"""
+    row = conn.execute("SELECT value FROM app_setting WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """写一条应用配置（同 key 覆盖）。"""
+    conn.execute(
+        "INSERT INTO app_setting(key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 def get_active_project_id(conn: sqlite3.Connection) -> int:
@@ -782,3 +1001,265 @@ def load_work_order_files(conn: sqlite3.Connection, order_id: int) -> List[Dict[
         "SELECT * FROM work_order_file WHERE order_id = ? ORDER BY id DESC",
         (int(order_id),))
     return [dict(row) for row in cur]
+
+
+# ---------------------------------------------------------------- 余料库（模块 10）
+SCRAP_COLUMNS = (
+    "name", "code", "material", "thickness", "width", "height",
+    "area", "outline", "source", "source_order_id", "note",
+)
+
+
+def _ring_area(ring: Any) -> float:
+    """鞋带公式算一个环的面积（只用于升级时挑外轮廓，不参与业务）。"""
+    try:
+        points = [(float(p[0]), float(p[1])) for p in ring]
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    if len(points) < 3:
+        return 0.0
+    total = 0.0
+    for index, (x1, y1) in enumerate(points):
+        x2, y2 = points[(index + 1) % len(points)]
+        total += x1 * y2 - x2 * y1
+    return abs(0.5 * total)
+
+
+def _outline_from_rings(text: Any) -> str:
+    """旧版余料存的是多环轮廓（rings = [外轮廓, 内孔...]）。
+
+    升级时挑面积最大的那个环作为余料边界，并把包围盒左下角平移到 (0,0)，
+    与当前“轮廓坐标相对自身包围盒左下角”的契约对齐。
+    """
+    try:
+        rings = json.loads(text or "[]")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(rings, list):
+        return ""
+    candidates = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 3]
+    if not candidates:
+        return ""
+    best = max(candidates, key=_ring_area)
+    try:
+        points = [(float(p[0]), float(p[1])) for p in best]
+    except (TypeError, ValueError, IndexError):
+        return ""
+    min_x = min(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+    outline = [[round(x - min_x, 3), round(y - min_y, 3)] for x, y in points]
+    return json.dumps(outline, ensure_ascii=False, separators=(",", ":"))
+
+
+def _scrap_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """行 -> 字典：轮廓从 JSON 还原成点数组，其余字段原样。"""
+    data = dict(row)
+    try:
+        data["outline"] = json.loads(data.get("outline") or "[]")
+    except (TypeError, ValueError):
+        data["outline"] = []
+    return data
+
+
+def insert_scrap(conn: sqlite3.Connection, project_id: int, data: Dict[str, Any]) -> int:
+    now = time.time()
+    marks = ", ".join("?" for _ in SCRAP_COLUMNS)
+    cur = conn.execute(
+        "INSERT INTO scrap(project_id, %s, created_at, updated_at) VALUES (?, %s, ?, ?)"
+        % (", ".join(SCRAP_COLUMNS), marks),
+        (project_id, *[data.get(name) for name in SCRAP_COLUMNS], now, now),
+    )
+    return int(cur.lastrowid)
+
+
+def update_scrap(conn: sqlite3.Connection, project_id: int, scrap_id: int,
+                 data: Dict[str, Any]) -> bool:
+    assignments = ", ".join("%s = ?" % name for name in SCRAP_COLUMNS)
+    cur = conn.execute(
+        "UPDATE scrap SET %s, updated_at = ? WHERE project_id = ? AND id = ?" % assignments,
+        (*[data.get(name) for name in SCRAP_COLUMNS], time.time(), project_id, int(scrap_id)),
+    )
+    return cur.rowcount > 0
+
+
+def load_scrap(conn: sqlite3.Connection, project_id: int,
+               scrap_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM scrap WHERE project_id = ? AND id = ?",
+        (project_id, int(scrap_id)),
+    ).fetchone()
+    return _scrap_row(row) if row is not None else None
+
+
+def list_scraps(conn: sqlite3.Connection, project_id: int, keyword: str = "",
+                limit: int = 200) -> List[Dict[str, Any]]:
+    """余料列表：名称/编号/物料模糊检索，最近入库的在前。"""
+    sql = "SELECT * FROM scrap WHERE project_id = ?"
+    args: List[Any] = [project_id]
+    if keyword:
+        like = "%" + keyword + "%"
+        sql += " AND (name LIKE ? OR code LIKE ? OR material LIKE ?)"
+        args.extend([like, like, like])
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    args.append(int(limit))
+    return [_scrap_row(row) for row in conn.execute(sql, args)]
+
+
+def delete_scrap(conn: sqlite3.Connection, project_id: int, scrap_id: int) -> bool:
+    cur = conn.execute(
+        "DELETE FROM scrap WHERE project_id = ? AND id = ?", (project_id, int(scrap_id)))
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------- MES 对接（模块 12）
+
+def _json_or(value: Any, default: Any) -> Any:
+    """宽松解析 JSON 字段：脏数据退回默认值，不让列表页崩掉。"""
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        parsed = json.loads(value or "")
+    except (TypeError, ValueError):
+        return default
+    return parsed if isinstance(parsed, type(default)) else default
+
+
+def _mes_order_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """行 -> 接口对象（camelCase，零件与原始响应直接从 JSON 还原）。"""
+    data = dict(row)
+    return {
+        "id": int(data["id"]),
+        "remoteId": data.get("remote_id") or "",
+        "projectId": int(data.get("project_id") or 0),
+        "name": data.get("name") or "",
+        "customer": data.get("customer") or "",
+        "material": data.get("material") or "",
+        "thickness": float(data.get("thickness") or 0.0),
+        "dueDate": data.get("due_date") or "",
+        "status": data.get("status") or "pulled",
+        "partCount": int(data.get("part_count") or 0),
+        "parts": _json_or(data.get("parts"), []),
+        "payload": _json_or(data.get("payload"), {}),
+        "pulledAt": float(data.get("pulled_at") or 0.0),
+        "archivedAt": (float(data["archived_at"])
+                       if data.get("archived_at") is not None else None),
+    }
+
+
+def upsert_mes_order(conn: sqlite3.Connection, project_id: int,
+                     data: Dict[str, Any]) -> Tuple[int, bool]:
+    """按 MES 单号 upsert；返回 (本地 id, 是否新增)。
+
+    重复拉单只刷新业务字段与 pulled_at，**不动 status/archived_at**：
+    已经回传归档的单不应因为又拉了一次就回到"待推送"。
+    """
+    remote_id = str(data.get("remote_id") or "").strip()
+    if not remote_id:
+        raise ValueError("MES 工单缺少单号")
+    now = time.time()
+    parts = json.dumps(data.get("parts") or [], ensure_ascii=False)
+    payload = json.dumps(data.get("payload") or {}, ensure_ascii=False)
+    row = conn.execute(
+        "SELECT id FROM mes_order WHERE remote_id = ?", (remote_id,)).fetchone()
+    if row is None:
+        cur = conn.execute(
+            "INSERT INTO mes_order(project_id, remote_id, name, customer, material, thickness,"
+            " due_date, status, part_count, parts, payload, pulled_at, archived_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (int(project_id or 0), remote_id, data.get("name") or "",
+             data.get("customer") or "", data.get("material") or "",
+             float(data.get("thickness") or 0.0), data.get("due_date") or "",
+             "pulled", int(data.get("part_count") or 0), parts, payload, now, None),
+        )
+        return int(cur.lastrowid), True
+    conn.execute(
+        "UPDATE mes_order SET project_id=?, name=?, customer=?, material=?, thickness=?,"
+        " due_date=?, part_count=?, parts=?, payload=?, pulled_at=? WHERE id=?",
+        (int(project_id or 0), data.get("name") or "", data.get("customer") or "",
+         data.get("material") or "", float(data.get("thickness") or 0.0),
+         data.get("due_date") or "", int(data.get("part_count") or 0), parts, payload,
+         now, int(row["id"])),
+    )
+    return int(row["id"]), False
+
+
+def load_mes_order(conn: sqlite3.Connection, order_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT * FROM mes_order WHERE id = ?", (int(order_id),)).fetchone()
+    return _mes_order_row(row) if row is not None else None
+
+
+def find_mes_order_by_remote(conn: sqlite3.Connection,
+                            remote_id: str) -> Optional[Dict[str, Any]]:
+    """按 MES 单号找本地缓存（导出后自动推送靠它预检）。"""
+    row = conn.execute(
+        "SELECT * FROM mes_order WHERE remote_id = ?", (str(remote_id).strip(),)).fetchone()
+    return _mes_order_row(row) if row is not None else None
+
+
+def list_mes_orders(conn: sqlite3.Connection, status: str = "",
+                    limit: int = 100) -> List[Dict[str, Any]]:
+    """MES 工单列表：status 为空返回全部，最近拉取的在前。"""
+    sql = "SELECT * FROM mes_order"
+    args: List[Any] = []
+    if status:
+        sql += " WHERE status = ?"
+        args.append(status)
+    sql += " ORDER BY pulled_at DESC, id DESC LIMIT ?"
+    args.append(max(1, int(limit)))
+    return [_mes_order_row(row) for row in conn.execute(sql, args)]
+
+
+def count_mes_orders(conn: sqlite3.Connection) -> Dict[str, int]:
+    """设置页的"工单 / 已归档"计数。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS total,"
+        " SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) AS archived FROM mes_order"
+    ).fetchone()
+    return {"total": int(row["total"] or 0), "archived": int(row["archived"] or 0)}
+
+
+def mark_mes_order_archived(conn: sqlite3.Connection, order_id: int,
+                           stamp: Optional[float] = None) -> bool:
+    """标记已回传归档；stamp 为空时用当前时间。"""
+    cur = conn.execute(
+        "UPDATE mes_order SET status = 'archived', archived_at = ? WHERE id = ?",
+        (float(stamp if stamp is not None else time.time()), int(order_id)),
+    )
+    return cur.rowcount > 0
+
+
+def insert_mes_log(conn: sqlite3.Connection, action: str, ok: bool,
+                   message: str = "", attempts: int = 0, status_code: int = 0,
+                   order_id: int = 0) -> int:
+    cur = conn.execute(
+        "INSERT INTO mes_push_log(order_id, action, ok, attempts, status_code, message, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (int(order_id or 0), action, int(bool(ok)), int(attempts), int(status_code),
+         message or "", time.time()),
+    )
+    return int(cur.lastrowid)
+
+
+def list_mes_logs(conn: sqlite3.Connection, order_id: int = 0,
+                  limit: int = 100) -> List[Dict[str, Any]]:
+    """交互日志，最新在前；order_id 非 0 时只看该单。"""
+    sql = "SELECT * FROM mes_push_log"
+    args: List[Any] = []
+    if order_id:
+        sql += " WHERE order_id = ?"
+        args.append(int(order_id))
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    args.append(max(1, int(limit)))
+    return [
+        {
+            "id": int(row["id"]),
+            "orderId": int(row["order_id"] or 0),
+            "action": row["action"] or "",
+            "ok": bool(row["ok"]),
+            "attempts": int(row["attempts"] or 0),
+            "statusCode": int(row["status_code"] or 0),
+            "message": row["message"] or "",
+            "createdAt": float(row["created_at"]),
+        }
+        for row in conn.execute(sql, args)
+    ]

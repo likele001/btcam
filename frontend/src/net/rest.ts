@@ -3,7 +3,14 @@
  * 图形数据绝不走这里 —— 见 net/protocol.ts。
  */
 
-import type { HealthInfo, LayoutPlacement, SheetSpec, TaskStats } from '@/types/geometry';
+import type {
+  HealthInfo,
+  LayoutPlacement,
+  ScrapInfo,
+  ScrapRegion,
+  SheetSpec,
+  TaskStats,
+} from '@/types/geometry';
 
 /** 后端地址：开发环境用默认端口，打包后由 Tauri 注入同端口 */
 const BACKEND = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://127.0.0.1:8975';
@@ -225,6 +232,73 @@ export interface PostProcessorInput {
 
 export interface PostListResponse {
   processors: PostProcessorRecord[];
+}
+
+// ------------------------------------------------------------ 后处理编辑器（模块 11）
+/** 占位符字典项：名字 + 中文说明 + 示例值，变量面板直接用 */
+export interface PostVariable {
+  name: string;
+  group: string;
+  desc: string;
+  example: string;
+}
+
+/** 变量字典：
+ *  - instructions 给出每类后处理有哪些指令槽位（前端据此生成编辑区）
+ *  - instructionLabels 是槽位的中文标题，不在前端硬编码
+ */
+export interface PostVariableDictionary {
+  variables: PostVariable[];
+  instructions: Record<string, string[]>;
+  instructionLabels: Record<string, Record<string, string>>;
+  kinds: string[];
+  notes: string;
+}
+
+/** 一条校验问题：field 与表单字段同名，用于高亮输入框 */
+export interface PostIssue {
+  field: string;
+  message: string;
+  hint?: string;
+}
+
+export interface PostValidateResult {
+  ok: boolean;
+  builtin: boolean;
+  errors: PostIssue[];
+  warnings: PostIssue[];
+  usedVariables: string[];
+  unusedVariables: string[];
+  unknownVariables: string[];
+}
+
+/** 预览参数：只是假数据，用来展示模板渲染效果 */
+export interface PostPreviewOptions {
+  sizeMm?: number;
+  depth?: number;
+  feed?: number;
+  safeZ?: number;
+  spindle?: number;
+  tool?: number;
+  flipY?: boolean;
+  speed?: number;
+  force?: number;
+  name?: string;
+  programNo?: string;
+}
+
+export interface PostPreviewResult {
+  ok: boolean;
+  text: string;
+  lineCount: number;
+  bytes: number;
+  note: string;
+  kind: string;
+  errors: PostIssue[];
+  warnings: PostIssue[];
+  usedVariables: string[];
+  unusedVariables: string[];
+  options?: PostPreviewOptions;
 }
 
 /** 导出单个文件的结果；多板批量时 files 有多条 */
@@ -452,6 +526,199 @@ export interface TaskCancelResult {
   status: string;
 }
 
+/* ---------------------------------------------------------------- MES 对接（模块 12）
+ * 对接 CenkorMes / LightMes：拉工单、回传归档。
+ * 整个模块是可选的：接口未启用时后端只回 400，不影响任何 CAM 功能。
+ */
+
+/** 配置回包：密钥只给掩码，`apiKey` 永远是空串 */
+export interface MesConfig {
+  enabled: boolean;
+  vendor: string;
+  baseUrl: string;
+  apiKey: string;
+  apiKeyMask?: string;
+  hasApiKey?: boolean;
+  timeout: number;
+  retries: number;
+  autoPush: boolean;
+  includeFiles: boolean;
+  paths: Record<string, string>;
+  /** 只读附加信息：厂商清单与各家默认路径 */
+  vendors?: Array<{ vendor: string; label: string }>;
+  defaults?: Record<string, { ping: string; orders: string; archive: string }>;
+  orderCount?: number;
+  archivedCount?: number;
+  lastLog?: MesLog | null;
+}
+
+/** 保存配置的入参：apiKey 留空 = 沿用已保存的密钥 */
+export type MesConfigInput = Pick<MesConfig,
+  'enabled' | 'vendor' | 'baseUrl' | 'timeout' | 'retries' | 'autoPush' | 'includeFiles'> & {
+  apiKey?: string;
+  paths?: Record<string, string>;
+};
+
+export interface MesPart {
+  name: string;
+  qty: number;
+  material: string;
+  thickness: number;
+  width: number;
+  height: number;
+  remoteId: string;
+}
+
+/** 本地缓存的 MES 工单；`status=archived` 表示已回传归档 */
+/** MES 单关联到的本地工单（work_order.code === remoteId）；未关联时为 null */
+export interface MesLocalWorkOrder {
+  id: number;
+  name: string;
+  code: string;
+  note: string;
+  createdAt: number;
+  updatedAt: number;
+  /** 工单快照里的零件数：0 说明工单存的时候画布还是空的 */
+  partCount: number;
+}
+
+export interface MesOrder {
+  id: number;
+  remoteId: string;
+  projectId: number;
+  name: string;
+  customer: string;
+  material: string;
+  thickness: number;
+  dueDate: string;
+  status: string;
+  partCount: number;
+  parts: MesPart[];
+  payload: Record<string, unknown>;
+  pulledAt: number;
+  archivedAt: number | null;
+  /** 后端算好的本地工单关联（回传时自动带上的那张单） */
+  localWorkOrder: MesLocalWorkOrder | null;
+}
+
+/** 交互日志：测试连接 / 拉单 / 推送各一条 */
+export interface MesLog {
+  id: number;
+  orderId: number;
+  action: string;
+  ok: boolean;
+  attempts: number;
+  statusCode: number;
+  message: string;
+  createdAt: number;
+}
+
+export interface MesTestResult {
+  ok: boolean;
+  vendor: string;
+  baseUrl: string;
+  statusCode: number;
+  attempts: number;
+  elapsedMs: number;
+  message: string;
+  response: Record<string, unknown>;
+}
+
+export interface MesPullResult {
+  ok: boolean;
+  pulled: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  problems: string[];
+  attempts: number;
+  statusCode: number;
+  elapsedMs: number;
+  orders: MesOrder[];
+}
+
+export interface MesPushResult {
+  ok: boolean;
+  orderId: number;
+  remoteId: string;
+  workOrderId: number | null;
+  statusCode: number;
+  attempts: number;
+  elapsedMs: number;
+  fileCount: number;
+  uploadedBytes: number;
+  message: string;
+  response: Record<string, unknown>;
+}
+
+/* ---------------------------------------------------------------- 余料库（模块 10）
+ * 排板切割后剩下的料：入库、检索、当板材用、剩余区域回收。
+ * 轮廓归一化/求差/面积全在后端（pyclipper），前端只拿点集画图。
+ */
+
+/** 新建/修改余料的入参；outline 为空时用 width/height 生成矩形 */
+export interface ScrapInput {
+  projectId?: number;
+  name?: string;
+  code?: string;
+  material?: string;
+  thickness?: number;
+  width?: number;
+  height?: number;
+  /** 轮廓点 [[x,y],...]，坐标系与板材一致 */
+  outline?: Array<[number, number]>;
+  note?: string;
+}
+
+export interface ScrapListResult {
+  projectId: number;
+  items: ScrapInfo[];
+  count: number;
+  totalArea: number;
+  /** 当前排料板正在用的那块（0 = 整板） */
+  currentScrapId: number;
+}
+
+export interface ScrapRemainingStats {
+  sheetWidth: number;
+  sheetHeight: number;
+  sheetArea: number;
+  usedArea: number;
+  leftoverArea: number;
+  /** 可回收面积 / 板材面积 */
+  leftoverRatio: number;
+  partCount: number;
+  gap: number;
+  scrapId: number;
+}
+
+export interface ScrapRemainingResult {
+  projectId: number;
+  regions: ScrapRegion[];
+  count: number;
+  stats: ScrapRemainingStats;
+}
+
+export interface ScrapSaveResult {
+  ok: boolean;
+  saved: ScrapInfo[];
+  count: number;
+  stats: ScrapRemainingStats;
+}
+
+/** 设为当前板材：sheet 为新的板框（余料包围盒，margin=0） */
+export interface ScrapApplyResult {
+  scrap: ScrapInfo;
+  stats: Record<string, number>;
+  sheet: SheetSpec;
+}
+
+export interface ScrapClearResult {
+  ok: boolean;
+  stats: Record<string, number>;
+  sheet: SheetSpec;
+}
+
 export const api = {
   health: () => request<HealthInfo>('/api/health'),
 
@@ -538,6 +805,26 @@ export const api = {
     }),
 
   exportDir: () => request<{ dir: string }>('/api/export/dir'),
+
+  /**
+   * 后处理可视化编辑器（模块 11）：保存/校验/预览全在后端。
+   * 预览与导出共用同一个渲染器，所以“预览什么样，导出就什么样”。
+   */
+  postEditor: {
+    variables: () => request<PostVariableDictionary>('/api/post/variables'),
+
+    validate: (processor: unknown, processorId?: string) =>
+      request<PostValidateResult>('/api/post/validate', {
+        method: 'POST',
+        body: JSON.stringify({ processor, processorId }),
+      }),
+
+    preview: (processor: unknown, options: PostPreviewOptions = {}) =>
+      request<PostPreviewResult>('/api/post/preview', {
+        method: 'POST',
+        body: JSON.stringify({ processor, options }),
+      }),
+  },
 
   /** 工单存档（模块 8）：本地 SQLite 快照，可检索、重新打开、另存 */
   workorders: {
@@ -682,5 +969,131 @@ export const api = {
     reset: (projectId?: number) =>
       request<LayoutActionResult>(`/api/layout/reset${projectId ? `?projectId=${projectId}` : ''}`,
         { method: 'POST' }),
+  },
+
+  /**
+   * 余料库（模块 10）：排完板存余料，下次开工单直接拿余料当板材。
+   * “当板材”不新增排料接口：只改板框 + 绑定 id，之后仍调 /api/layout/*。
+   */
+  scrap: {
+    list: (params: { keyword?: string; limit?: number; projectId?: number } = {}) => {
+      const query = new URLSearchParams();
+      if (params.keyword) query.set('keyword', params.keyword);
+      if (params.limit) query.set('limit', String(params.limit));
+      if (params.projectId) query.set('projectId', String(params.projectId));
+      const suffix = query.toString();
+      return request<ScrapListResult>(`/api/scrap${suffix ? `?${suffix}` : ''}`);
+    },
+
+    get: (id: number, projectId?: number) =>
+      request<ScrapInfo>(`/api/scrap/${id}${projectId ? `?projectId=${projectId}` : ''}`),
+
+    create: (payload: ScrapInput) =>
+      request<ScrapInfo>('/api/scrap', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    update: (id: number, payload: ScrapInput) =>
+      request<ScrapInfo>(`/api/scrap/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+
+    remove: (id: number, projectId?: number) =>
+      request<{ deleted: boolean; id: number; unbound: boolean }>(
+        `/api/scrap/${id}${projectId ? `?projectId=${projectId}` : ''}`, { method: 'DELETE' }),
+
+    /** 算当前板材的剩余区域（预览，不落库） */
+    remaining: (payload: { projectId?: number; gap?: number | null; minArea?: number }) =>
+      request<ScrapRemainingResult>('/api/scrap/remaining', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 把勾选的区域存进余料库：只传 index，几何由后端重算 */
+    save: (payload: {
+      projectId?: number;
+      indices: number[];
+      gap?: number | null;
+      minArea?: number;
+      namePrefix?: string;
+      material?: string;
+      thickness?: number;
+      note?: string;
+    }) =>
+      request<ScrapSaveResult>('/api/scrap/save', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 把余料设为当前板材（轮廓即边界，margin 归零） */
+    apply: (id: number, payload: { projectId?: number; gap?: number | null; resetPlacements?: boolean } = {}) =>
+      request<ScrapApplyResult>(`/api/scrap/${id}/apply`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 解绑余料，退回规则矩形板（可同时套用新尺寸） */
+    clear: (payload: { projectId?: number; width?: number; height?: number; margin?: number; gap?: number } = {}) =>
+      request<ScrapClearResult>('/api/scrap/clear', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+  },
+
+  /**
+   * MES 对接（模块 12）：拉工单 + 回传归档。
+   * 前端只做搬运与展示：字段归一化、重试、幂等全部在后端。
+   */
+  mes: {
+    settings: () => request<MesConfig>('/api/mes/settings'),
+
+    /** 保存配置；apiKey 传空串表示“不改密钥” */
+    saveSettings: (payload: MesConfigInput) =>
+      request<MesConfig>('/api/mes/settings', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 测试连接：可传未保存的草稿，便于“先测后存” */
+    test: (payload?: MesConfigInput) =>
+      request<MesTestResult>('/api/mes/test', payload
+        ? { method: 'POST', body: JSON.stringify(payload) }
+        : { method: 'POST' }),
+
+    /** 拉取工单：按 MES 单号 upsert，重复拉不会重复入库 */
+    pull: (params: { projectId?: number; limit?: number } = {}) =>
+      request<MesPullResult>('/api/mes/pull', {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }),
+
+    orders: (params: { status?: string; limit?: number } = {}) => {
+      const query = new URLSearchParams();
+      if (params.status) query.set('status', params.status);
+      if (params.limit) query.set('limit', String(params.limit));
+      const suffix = query.toString();
+      return request<{ items: MesOrder[]; count: number; archivedCount: number; linkedCount: number }>(
+        `/api/mes/orders${suffix ? `?${suffix}` : ''}`);
+    },
+
+    order: (id: number) => request<MesOrder>(`/api/mes/orders/${id}`),
+
+    /** 回传归档：workOrderId 不传时后端按 MES 单号自动找同编号本地工单 */
+    push: (payload: { orderId: number; workOrderId?: number | null; includeFiles?: boolean | null }) =>
+      request<MesPushResult>('/api/mes/push', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    logs: (params: { orderId?: number; limit?: number } = {}) => {
+      const query = new URLSearchParams();
+      if (params.orderId) query.set('orderId', String(params.orderId));
+      if (params.limit) query.set('limit', String(params.limit));
+      const suffix = query.toString();
+      return request<{ items: MesLog[]; count: number }>(
+        `/api/mes/logs${suffix ? `?${suffix}` : ''}`);
+    },
   },
 };

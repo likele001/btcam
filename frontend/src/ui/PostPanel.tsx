@@ -19,88 +19,13 @@ import type {
   PostProcessorRecord,
 } from '@/net/rest';
 import { useAppStore } from '@/state/app-store';
+import {
+  BLANK_GCODE, BLANK_HPGL, KIND_LABEL, cloneProcessor, suggestId, switchKind,
+} from './postDrafts';
 import { formatForKind, toProcessorInput, usePostActions } from './usePostActions';
+import { usePostEditorActions } from './usePostEditorActions';
 
 type Tab = 'export' | 'config';
-
-const KIND_LABEL: Record<PostKind, string> = {
-  gcode: 'G 代码',
-  hpgl: 'HPGL 笔式',
-  dxf: 'DXF 图形',
-};
-
-const KIND_EXT: Record<PostKind, string> = {
-  gcode: 'nc',
-  hpgl: 'plt',
-  dxf: 'dxf',
-};
-
-/** 新建 gcode 配置时的最小可用模板：字段必须齐全，后端要求 5 条指令模板不为空 */
-const BLANK_GCODE: GcodePostConfig = {
-  precision: 3,
-  lineNumbers: false,
-  lineNumberStart: 10,
-  lineNumberStep: 10,
-  programNo: '0001',
-  header: [
-    '%',
-    '( BTCAM - {name} )',
-    '( Generated {date} )',
-    'G21',
-    'G90',
-    'G17',
-    'G40',
-    'G0 Z{safeZ}',
-    'M3 S{spindle}',
-  ],
-  footer: ['G0 Z{safeZ}', 'M5', 'M30', '%'],
-  toolChange: ['T{tool} M6', 'G43 H{tool}'],
-  rapidZ: 'G0 Z{z}',
-  rapidXY: 'G0 X{x} Y{y}',
-  plungeZ: 'G1 Z{z} F{feed}',
-  feed: 'F{feed}',
-  cutXY: 'G1 X{x} Y{y}',
-};
-
-const BLANK_HPGL: HpglPostConfig = {
-  unitsPerMm: 40,
-  header: ['IN;', 'SP1;'],
-  footer: ['SP0;'],
-  penUp: 'PU{x},{y};',
-  penDown: 'PD{x},{y};',
-  penLift: 'PU;',
-};
-
-function cloneProcessor(record: PostProcessorRecord): PostProcessorRecord {
-  return {
-    ...record,
-    gcode: record.gcode
-      ? {
-        ...record.gcode,
-        header: [...record.gcode.header],
-        footer: [...record.gcode.footer],
-        toolChange: [...record.gcode.toolChange],
-      }
-      : undefined,
-    hpgl: record.hpgl
-      ? { ...record.hpgl, header: [...record.hpgl.header], footer: [...record.hpgl.footer] }
-      : undefined,
-    dxf: record.dxf ? { ...record.dxf } : undefined,
-  };
-}
-
-/** 另存为时生成一个不冲突的 id（后端限制 2~40 位小写字母/数字/下划线） */
-function suggestId(base: string, processors: PostProcessorRecord[]): string {
-  const taken = new Set(processors.map((item) => item.id));
-  const stem = base.replace(/[^a-z0-9_]/g, '_').slice(0, 34) || 'custom_post';
-  let candidate = stem;
-  let index = 2;
-  while (taken.has(candidate)) {
-    candidate = `${stem}_${index}`;
-    index += 1;
-  }
-  return candidate;
-}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
@@ -143,6 +68,8 @@ export function PostPanel(): JSX.Element | null {
   const setExportPreset = useAppStore((s) => s.setExportPreset);
 
   const { close, save, remove, exportNow, showExportDir } = usePostActions();
+  // 可视化编辑器（模块 11）：带校验与预览，从当前选中的机床打开
+  const { open: openVisualEditor } = usePostEditorActions();
 
   const [tab, setTab] = useState<Tab>('export');
   const [exportId, setExportId] = useState('');
@@ -306,21 +233,7 @@ export function PostPanel(): JSX.Element | null {
       : prev));
 
   /** 切换类别时补一份该类别的最小配置，并同步默认扩展名 */
-  const changeKind = (kind: PostKind) => setDraft((prev) => {
-    if (!prev) return prev;
-    return {
-      ...prev,
-      kind,
-      ext: prev.kind === kind ? prev.ext : KIND_EXT[kind],
-      gcode: kind === 'gcode'
-        ? (prev.gcode ?? { ...BLANK_GCODE, header: [...BLANK_GCODE.header], footer: [...BLANK_GCODE.footer], toolChange: [...BLANK_GCODE.toolChange] })
-        : prev.gcode,
-      hpgl: kind === 'hpgl'
-        ? (prev.hpgl ?? { ...BLANK_HPGL, header: [...BLANK_HPGL.header], footer: [...BLANK_HPGL.footer] })
-        : prev.hpgl,
-      dxf: kind === 'dxf' ? (prev.dxf ?? { version: 'R2010' }) : prev.dxf,
-    };
-  });
+  const changeKind = (kind: PostKind) => setDraft((prev) => (prev ? switchKind(prev, kind) : prev));
 
   const gcode = draft?.gcode ?? BLANK_GCODE;
   const hpgl = draft?.hpgl ?? BLANK_HPGL;
@@ -464,6 +377,15 @@ export function PostPanel(): JSX.Element | null {
               >
                 编辑配置…
               </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => openVisualEditor(exportProcessor ? exportProcessor.id : '')}
+                disabled={!exportProcessor}
+                title="带变量提示、后端校验与实时预览的模板编辑器"
+              >
+                可视化编辑…
+              </button>
               <button type="button" className="btn" onClick={() => void showExportDir()}>
                 导出目录
               </button>
@@ -495,7 +417,16 @@ export function PostPanel(): JSX.Element | null {
             <div className="tool-list-pane">
               <div className="tool-list-head">
                 <span>机床</span>
-                <button type="button" className="btn" onClick={newProcessor}>新建</button>
+                <div className="pe-head-actions">
+                  <button type="button" className="btn" onClick={newProcessor}>新建</button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => openVisualEditor(draft ? draft.id : '')}
+                  >
+                    可视化编辑
+                  </button>
+                </div>
               </div>
               <div className="tool-list">
                 {processors.length === 0 && (

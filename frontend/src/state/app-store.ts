@@ -27,6 +27,7 @@ import type {
   LayoutState,
   PartInfo,
   Polyline,
+  ScrapInfo,
   SheetSpec,
   TaskInfo,
   TaskStats,
@@ -84,6 +85,9 @@ interface AppState {
   /** 后处理（模块 7）：一份配置一台机床，弹窗与导出共用 */
   postProcessors: PostProcessorRecord[];
   postOpen: boolean;
+  /** 后处理可视化编辑器（模块 11）：开关 + 打开时默认选中的机床 id */
+  postEditorOpen: boolean;
+  postEditorTarget: string;
   /** 最近一次导出的文件列表（多板批量时为多条） */
   lastExport: ExportResult | null;
   /** 工单存档（模块 8）：列表、弹窗开关、当前打开的工单 */
@@ -94,6 +98,12 @@ interface AppState {
   /** 运行日志（模块 9）：日志面板的数据源 */
   logs: LogEntry[];
   logOpen: boolean;
+  /** 关于弹窗（版本信息）：生产包已关掉开发者工具，版本/数据目录/引擎状态都在这里看 */
+  aboutOpen: boolean;
+  /** MES 对接（模块 12）：设置页/工单列表弹窗开关 */
+  mesOpen: boolean;
+  /** 余料库（模块 10）：余料面板弹窗开关 */
+  scrapOpen: boolean;
   /** 日志缓冲容量与磁盘文件路径（面板底部展示） */
   logCapacity: number;
   logFile: string;
@@ -130,6 +140,7 @@ interface AppState {
   setToolLibraryOpen: (open: boolean) => void;
   setPostProcessors: (processors: PostProcessorRecord[]) => void;
   setPostOpen: (open: boolean) => void;
+  setPostEditorOpen: (open: boolean, target?: string) => void;
   setLastExport: (result: ExportResult | null) => void;
   setWorkOrders: (orders: WorkOrderSummary[]) => void;
   setWorkOrderOpen: (open: boolean) => void;
@@ -138,6 +149,9 @@ interface AppState {
   setLogs: (logs: LogEntry[], meta?: { capacity?: number; file?: string }) => void;
   appendLog: (entry: LogEntry) => void;
   setLogOpen: (open: boolean) => void;
+  setAboutOpen: (open: boolean) => void;
+  setMesOpen: (open: boolean) => void;
+  setScrapOpen: (open: boolean) => void;
   pushAlert: (entry: LogEntry) => void;
   dismissAlert: () => void;
 }
@@ -177,6 +191,39 @@ const pickIssues = (meta: Record<string, unknown>): GeometryIssue[] =>
     }))
     : [];
 
+/** 余料（模块 10）：排料帧里带 scrap 时，边界用它而不是矩形板 */
+const pickScrap = (meta: Record<string, unknown>): ScrapInfo | null => {
+  const raw = meta.scrap;
+  if (!raw || typeof raw !== 'object') return null;
+  const data = raw as Record<string, unknown>;
+  const outline = Array.isArray(data.outline)
+    ? (data.outline as Array<Record<string, unknown> | number[]>)
+      .map((point) => (Array.isArray(point)
+        ? [Number(point[0] ?? 0), Number(point[1] ?? 0)] as [number, number]
+        : [Number((point as Record<string, unknown>).x ?? 0),
+          Number((point as Record<string, unknown>).y ?? 0)] as [number, number]))
+    : [];
+  if (outline.length < 3) return null;
+  return {
+    id: Number(data.id ?? 0),
+    projectId: Number(data.projectId ?? 0),
+    name: String(data.name ?? '余料'),
+    code: String(data.code ?? ''),
+    material: String(data.material ?? ''),
+    thickness: Number(data.thickness ?? 0),
+    width: Number(data.width ?? 0),
+    height: Number(data.height ?? 0),
+    area: Number(data.area ?? 0),
+    outline,
+    points: outline.length,
+    source: String(data.source ?? ''),
+    sourceOrderId: Number(data.sourceOrderId ?? 0),
+    note: String(data.note ?? ''),
+    createdAt: Number(data.createdAt ?? 0),
+    updatedAt: Number(data.updatedAt ?? 0),
+  };
+};
+
 const pickLayout = (meta: Record<string, unknown>): LayoutState | null => {
   // 板材参数缺失说明这不是排料帧（或旧版本后端），不当作排料状态处理
   if (!meta.sheet || typeof meta.sheet !== 'object') return null;
@@ -189,7 +236,9 @@ const pickLayout = (meta: Record<string, unknown>): LayoutState | null => {
       height: Number(sheet.height ?? 0),
       margin: Number(sheet.margin ?? 0),
       gap: Number(sheet.gap ?? 0),
+      scrapId: Number(sheet.scrapId ?? 0),
     },
+    scrap: pickScrap(meta),
     parts: parts.map((raw) => ({
       id: Number(raw.id),
       name: String(raw.name ?? '零件'),
@@ -215,6 +264,8 @@ const pickLayout = (meta: Record<string, unknown>): LayoutState | null => {
       sheetHeight: Number(stats.sheetHeight ?? 0),
       gap: Number(stats.gap ?? 0),
       margin: Number(stats.margin ?? 0),
+      scrapId: Number(stats.scrapId ?? 0),
+      boundaryArea: Number(stats.boundaryArea ?? 0),
     },
   };
 };
@@ -343,6 +394,8 @@ export const useAppStore = create<AppState>((set) => ({
   toolLibraryOpen: false,
   postProcessors: [],
   postOpen: false,
+  postEditorOpen: false,
+  postEditorTarget: '',
   lastExport: null,
   workOrders: [],
   workOrderOpen: false,
@@ -350,6 +403,9 @@ export const useAppStore = create<AppState>((set) => ({
   exportPreset: { flipY: false, speed: 30, force: 20 },
   logs: [],
   logOpen: false,
+  aboutOpen: false,
+  mesOpen: false,
+  scrapOpen: false,
   logCapacity: 0,
   logFile: '',
   alerts: [],
@@ -533,6 +589,12 @@ export const useAppStore = create<AppState>((set) => ({
 
   setPostOpen: (postOpen) => set({ postOpen }),
 
+  // 打开编辑器时一并记住要编辑哪台机床（'' = 从第一台开始）
+  setPostEditorOpen: (postEditorOpen, target) => set((state) => ({
+    postEditorOpen,
+    postEditorTarget: target ?? state.postEditorTarget,
+  })),
+
   setLastExport: (lastExport) => set({ lastExport }),
 
   setWorkOrders: (workOrders) => set({ workOrders }),
@@ -555,6 +617,13 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({ logs: mergeLogs(state.logs, [entry]) })),
 
   setLogOpen: (logOpen) => set({ logOpen }),
+
+  setAboutOpen: (aboutOpen) => set({ aboutOpen }),
+
+  setMesOpen: (mesOpen) => set({ mesOpen }),
+
+  /** 余料库弹窗（模块 10）：与 MES 一样是独立浮层，不切换左侧面板 */
+  setScrapOpen: (scrapOpen) => set({ scrapOpen }),
 
   pushAlert: (entry) =>
     set((state) => {

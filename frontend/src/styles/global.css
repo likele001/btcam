@@ -1777,6 +1777,1115 @@ body {
   font-size: 11px;
 }
 
+/* ------------------------------------------------------------ MES 对接（模块 12） */
+.mes-panel {
+  width: min(980px, calc(100vw - 72px));
+  height: min(680px, calc(100vh - 72px));
+}
+
+/* 长地址/密钥行：标签固定、输入框撑满剩余宽度 */
+.mes-panel .form-row-wide > input {
+  flex: 1;
+  width: auto;
+}
+
+/* tool-summary 在 MES 里用于四宫格状态（左标签右值） */
+.mes-panel .tool-summary > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mes-panel .tool-summary b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mes-on { color: var(--success); }
+.mes-off { color: var(--text-faint); }
+
+.mes-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.mes-paths-title {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.mes-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 12px;
+}
+
+.mes-actions .btn { padding: 0 16px; }
+
+.mes-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 动作结果条：绿=成功，红=失败 */
+.mes-result {
+  margin: 0 14px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.mes-result b { display: block; font-size: 12px; }
+.mes-result span { color: var(--text-dim); }
+.mes-result p { margin: 4px 0 0; color: var(--text-faint); }
+.mes-result.ok { border-color: rgba(63, 191, 127, 0.45); background: rgba(63, 191, 127, 0.08); }
+.mes-result.bad { border-color: rgba(240, 90, 90, 0.45); background: rgba(240, 90, 90, 0.08); }
+
+/* 工单页：左列表右详情（复用刀具库两栏骨架） */
+.mes-list-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.mes-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mes-toolbar .btn { padding: 0 14px; }
+
+.mes-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.mes-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mes-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+
+.mes-item:hover { border-color: var(--border-strong); }
+
+.mes-item.active {
+  border-color: var(--accent);
+  background: rgba(79, 163, 255, 0.1);
+}
+
+.mes-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.mes-item-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.mes-item-time { color: var(--text-faint); }
+
+.mes-badge {
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.mes-badge.pulled { color: var(--warning); }
+.mes-badge.archived { color: var(--success); }
+/* MES 单 ↔ 本地工单的关联状态：不建工单就回传，只会推 MES 单信息与零件清单 */
+.mes-badge.linked { color: var(--accent); }
+.mes-badge.unlinked { color: var(--text-faint); }
+
+.mes-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding-bottom: 12px;
+}
+
+.mes-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px 0;
+  font-size: 12px;
+}
+
+.mes-detail-head span { color: var(--text-faint); }
+
+.mes-detail-empty { margin: auto; }
+
+.mes-parts {
+  margin: 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mes-parts-head { font-size: 11px; color: var(--text-faint); }
+
+.mes-part {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  font-size: 11px;
+}
+
+.mes-part-meta { color: var(--text-dim); }
+
+.mes-raw {
+  margin: 0 14px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.mes-raw pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: var(--radius);
+  background: var(--bg-app);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+
+/* 日志页：时间 / 动作 / 结果 / 详情 四列 */
+.mes-logs {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.mes-log-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mes-log {
+  display: grid;
+  grid-template-columns: 128px 76px 132px 1fr;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  font-size: 11px;
+}
+
+.mes-log.ok { border-left: 2px solid var(--success); }
+.mes-log.bad { border-left: 2px solid var(--danger); }
+
+.mes-log-time { color: var(--text-faint); }
+.mes-log-status { color: var(--text-dim); }
+
+.mes-log-msg {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------ 余料库（模块 10） */
+.scrap-panel {
+  width: min(780px, calc(100vw - 72px));
+  height: min(640px, calc(100vh - 72px));
+}
+
+/* 页签内容：整列一起滚，列表不单独滚，避免出现两条滚动条 */
+.scrap-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px 14px;
+}
+
+/* 工具条：检索框 + 操作按钮 + 状态提示，空间不够时允许换行 */
+.scrap-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scrap-bar .btn {
+  flex: 0 0 auto;
+  padding: 0 12px;
+}
+
+.scrap-search {
+  flex: 0 0 220px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.scrap-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 口径说明 / 当前板材状态：弱化到不抢列表 */
+.scrap-hint {
+  flex: 1;
+  min-width: 140px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.scrap-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scrap-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+/* 正在当板材用的那块：与刀具库选中行同一套高亮 */
+.scrap-row-active {
+  border-color: var(--accent-dim);
+  background: rgba(79, 163, 255, 0.12);
+}
+
+.scrap-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.scrap-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 行内小标记：使用中 / 排板来源 */
+.scrap-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(79, 163, 255, 0.18);
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.scrap-tag-dim {
+  background: rgba(159, 179, 200, 0.14);
+  color: var(--text-faint);
+}
+
+.scrap-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.scrap-row-actions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+
+.scrap-row-actions .btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.scrap-kv {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: rgba(79, 163, 255, 0.08);
+}
+
+/* 剩余区域一行：勾选框 + 序号 + 尺寸 + 面积 + 点数 */
+.scrap-region {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.scrap-region:hover {
+  border-color: var(--border-strong);
+}
+
+.scrap-region input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.scrap-region-index {
+  color: var(--text-dim);
+}
+
+.scrap-region-area {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+.scrap-region-points {
+  width: 52px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 内联标签输入（最小面积）：标签在左、输入在右，与表单行同高 */
+.scrap-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.scrap-inline input {
+  width: 96px;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.scrap-inline input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 表单区加一条分隔线，与列表区分开 */
+.scrap-manual,
+.scrap-save {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.scrap-foot {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+/* 排料面板顶部：当前板材是余料时的摘要条 */
+.panel-scrap {
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  background: rgba(79, 163, 255, 0.08);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.panel-scrap-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-scrap-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-scrap-btn {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.panel-scrap-meta {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-scrap-hint {
+  margin-top: 2px;
+  color: var(--text-faint);
+}
+
+/* 没绑余料时弱化成一行提示，不占视觉重心 */
+.panel-scrap-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-left-color: var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-faint);
+}
+
+.panel-scrap-empty > span {
+  flex: 1;
+}
+
+/* ------------------------------------------------------------ 后处理可视化编辑器（模块 11） */
+.post-editor {
+  width: min(1180px, calc(100vw - 56px));
+  height: min(760px, calc(100vh - 56px));
+}
+
+/* 左：机床列表 / 中：模板编辑 / 右：变量 + 校验 + 预览 */
+.pe-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr) 400px;
+}
+
+.pe-empty { margin: auto; }
+
+.pe-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.pe-side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.pe-head-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.pe-head-actions .btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.pe-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pe-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pe-item:hover { background: var(--bg-hover); }
+
+.pe-item-active {
+  border-color: var(--accent-dim);
+  background: rgba(79, 163, 255, 0.12);
+}
+
+.pe-item-name { font-size: 12px; }
+
+.pe-item-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 编辑列：内容很长，自己滚 */
+.pe-edit {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 16px;
+}
+
+.pe-edit-head {
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* 内置模板提示条：提醒另存为，不占错误列表 */
+.pe-banner {
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border-left: 2px solid var(--warning);
+  border-radius: var(--radius);
+  background: rgba(240, 170, 60, 0.1);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* 分区标题：左侧竖线，长表单里靠它分段 */
+.pe-sec {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--accent-dim);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.pe-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+  padding: 4px 0 0;
+}
+
+.pe-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.pe-line input,
+.pe-line select {
+  width: 130px;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.pe-line input[readonly],
+.pe-line select:disabled {
+  color: var(--text-faint);
+  background: var(--bg-app);
+  cursor: not-allowed;
+}
+
+.pe-line input:focus,
+.pe-line select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pe-line-wide { grid-column: 1 / -1; }
+
+.pe-line-wide input { flex: 1; width: auto; text-align: left; }
+
+/* 复选项：勾选框不用拉满整行 */
+.pe-check input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* 校验失败字段：红边提示，左侧标签不变色（不抢文字可读性） */
+.pe-bad input,
+.pe-bad select,
+.pe-bad textarea {
+  border-color: var(--danger);
+}
+
+/* 多行模板：等宽字体 + 行高，便于对齐 G 代码 */
+.pe-area {
+  display: block;
+  margin-top: 6px;
+}
+
+.pe-area-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.pe-area-head em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pe-area textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: Consolas, 'Cascadia Mono', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.pe-area textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pe-area textarea[readonly] {
+  color: var(--text-dim);
+}
+
+.pe-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.pe-actions .btn {
+  flex: 0 0 auto;
+  padding: 0 16px;
+}
+
+/* 右列：变量面板 + 校验结果 + 预览，自身可滚 */
+.pe-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 14px;
+  border-left: 1px solid var(--border);
+  background: var(--bg-app);
+}
+
+.pe-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pe-var-title {
+  margin-bottom: 3px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pe-var-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.pe-var {
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-family: Consolas, 'Cascadia Mono', monospace;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pe-var:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.pe-var-copied {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.pe-badge {
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.pe-badge-ok { background: rgba(63, 191, 127, 0.16); color: var(--success); }
+.pe-badge-bad { background: rgba(240, 90, 90, 0.16); color: var(--danger); }
+
+.pe-dim { font-size: 11px; color: var(--text-faint); }
+
+.pe-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.pe-used {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pe-issue,
+.pe-warn {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border-radius: var(--radius);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pe-issue {
+  border-left: 2px solid var(--danger);
+  background: rgba(240, 90, 90, 0.08);
+}
+
+.pe-warn {
+  border-left: 2px solid var(--warning);
+  background: rgba(240, 170, 60, 0.08);
+}
+
+.pe-issue b,
+.pe-warn b {
+  font-weight: 500;
+  font-family: Consolas, 'Cascadia Mono', monospace;
+  color: var(--text-dim);
+}
+
+.pe-issue span { color: var(--text); }
+.pe-warn span { color: var(--text-dim); }
+
+.pe-issue em {
+  font-style: normal;
+  color: var(--text-faint);
+}
+
+.pe-note {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 预览参数：尺寸/进给是假数据，只影响预览不影响导出 */
+.pe-opts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.pe-opts label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pe-opts input[type='number'] {
+  width: 74px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.pe-opts input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.pe-opts .btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+/* 渲染结果：行号 + 等宽文本，固定行高方便逐行对齐 */
+.pe-code {
+  flex: 1;
+  min-height: 120px;
+  margin-top: 6px;
+  padding: 6px 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #0d1117;
+  font-family: Consolas, 'Cascadia Mono', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pe-code-row {
+  display: flex;
+  gap: 10px;
+  padding: 0 8px;
+}
+
+.pe-code-row:hover { background: rgba(79, 163, 255, 0.06); }
+
+.pe-ln {
+  flex: 0 0 30px;
+  text-align: right;
+  color: #4b5563;
+  user-select: none;
+}
+
+.pe-code-text {
+  white-space: pre;
+  color: #c9d4e3;
+}
+
+.pe-preview-empty {
+  margin-top: 10px;
+  padding: 24px 12px;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------ 关于弹窗 */
+/* 生产包没有开发者工具，版本号/数据目录/引擎状态统一在这里展示 */
+.about-dialog {
+  width: min(560px, calc(100vw - 72px));
+}
+
+.about-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+}
+
+.about-hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.about-hero .brand-dot {
+  width: 14px;
+  height: 14px;
+}
+
+.about-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+
+.about-badge {
+  padding: 1px 7px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 10px;
+  background: rgba(79, 163, 255, 0.12);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.about-tagline {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* 两列键值表：dt 固定宽度，长路径用省略号 + title 悬浮看全 */
+.about-facts {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  font-size: 12px;
+}
+
+.about-facts dt {
+  color: var(--text-faint);
+}
+
+.about-facts dd {
+  margin: 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.about-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.about-section-title {
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.6px;
+}
+
+.about-modules {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.about-module {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.about-module-no {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.about-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.about-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.about-copyright {
+  margin-right: auto;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 状态栏版本角标：低对比度，不抢消息区的注意力 */
+.status-version {
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ------------------------------------------------------------ 滚动条 */
 ::-webkit-scrollbar {
   width: 9px;

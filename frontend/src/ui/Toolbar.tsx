@@ -11,7 +11,9 @@ import { api } from '@/net/rest';
 import { requestGeometrySync } from '@/net/session';
 import { useAppStore } from '@/state/app-store';
 import { useLayoutActions } from './useLayoutActions';
+import { useMesActions } from './useMesActions';
 import { usePostActions } from './usePostActions';
+import { useScrapActions } from './useScrapActions';
 import { useToolpathActions } from './useToolpathActions';
 import { useToolLibraryActions } from './useToolLibraryActions';
 import { useWorkOrderActions } from './useWorkOrderActions';
@@ -30,6 +32,7 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
   const setBusy = useAppStore((s) => s.setBusy);
   const setMessage = useAppStore((s) => s.setMessage);
   const setLogOpen = useAppStore((s) => s.setLogOpen);
+  const setAboutOpen = useAppStore((s) => s.setAboutOpen);
 
   // 隐藏的文件选择框：Tauri 窗口内弹出原生文件对话框
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -44,6 +47,10 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
   const { open: openPost, exportNow } = usePostActions();
   // 工单存档（模块 8）：保存/检索/重复打开
   const { open: openWorkOrders } = useWorkOrderActions();
+  // 余料库（模块 10）：存余料 / 选余料当板材 / 解绑回整板
+  const { open: openScrap } = useScrapActions();
+  // MES 对接（模块 12）：可选件，离线时打开也不影响 CAM
+  const { open: openMes } = useMesActions();
 
   /** 最近一次导入任务：它的进度就是导入进度条的数据源 */
   const importTask = tasks.find((task) => task.kind === 'import') ?? null;
@@ -199,8 +206,17 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
         <button type="button" className="btn" onClick={() => void openWorkOrders()}>
           工单…
         </button>
+        <button type="button" className="btn" onClick={openScrap}>
+          余料…
+        </button>
+        <button type="button" className="btn" onClick={openMes}>
+          MES…
+        </button>
         <button type="button" className="btn" onClick={openPost}>
           后处理…
+        </button>
+        <button type="button" className="btn" onClick={() => setAboutOpen(true)} title="版本信息">
+          关于…
         </button>
         <span className="toolbar-hint">导出</span>
         {(['nc', 'plt', 'cut', 'dxf'] as const).map((fmt) => (

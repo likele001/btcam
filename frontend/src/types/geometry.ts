@@ -59,6 +59,47 @@ export interface SheetSpec {
   height: number;
   margin: number;
   gap: number;
+  /** 非 0 表示当前板材是余料库里的某块余料，轮廓即真实边界 */
+  scrapId?: number;
+}
+
+/**
+ * 余料（模块 10）：排板切割后剩下的料。
+ *
+ * outline 的坐标相对**自身包围盒左下角**，与板材坐标同构，
+ * 所以直接当板材用时不需要任何平移；几何全部由后端算好。
+ */
+export interface ScrapInfo {
+  id: number;
+  projectId: number;
+  name: string;
+  code: string;
+  material: string;
+  thickness: number;
+  /** 包围盒宽高（mm） */
+  width: number;
+  height: number;
+  /** 轮廓净面积（mm²） */
+  area: number;
+  /** 闭合多边形点集（不重复首点） */
+  outline: Array<[number, number]>;
+  points: number;
+  /** manual = 手工录入；layout = 排板剩余区域保存 */
+  source: string;
+  sourceOrderId: number;
+  note: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 排板剩余区域：outline 是**板材坐标**，前端只画预览与勾选 */
+export interface ScrapRegion {
+  index: number;
+  area: number;
+  width: number;
+  height: number;
+  outline: Array<[number, number]>;
+  points: number;
 }
 
 /** 一个零件在板材上的摆放状态（后端持久化，前端只读） */
@@ -103,6 +144,10 @@ export interface LayoutStats {
   sheetHeight: number;
   gap: number;
   margin: number;
+  /** 当前板材绑定的余料 id（0 = 规则整板） */
+  scrapId?: number;
+  /** 真实可用边界面积：余料轮廓面积或矩形板面积 */
+  boundaryArea?: number;
 }
 
 /** 排料视图全量状态（来自 LAYOUT_STATE 帧） */
@@ -110,6 +155,8 @@ export interface LayoutState {
   sheet: SheetSpec;
   parts: LayoutPartInfo[];
   stats: LayoutStats;
+  /** 余料作为板材时下发（含轮廓），否则为 null */
+  scrap?: ScrapInfo | null;
 }
 
 export interface Rect {
