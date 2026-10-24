@@ -40,4 +40,11 @@ exports/
 *.swp
 Thumbs.db
 desktop.ini
-vs_buildtools.exe
+
+# ---------------- 构建产物 / 工具安装包（体积大，不入库） ----------------
+dist/
+*.msi
+*.wixpdb
+build_*.log
+vs_buildtools*.exe
+wix*-binaries.zip

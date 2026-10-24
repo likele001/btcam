@@ -142,6 +142,11 @@ try {
 
 # ------------------------------------------------------------ 5/6 Tauri 构建
 Step '5/6' 'Tauri 构建（Release，首次编译较慢）'
+
+# 国内直连 GitHub 下载 NSIS/WiX 工具易超时，走官方镜像模板加速
+$env:TAURI_BUNDLER_TOOLS_GITHUB_MIRROR_TEMPLATE = 'https://gh-proxy.com/https://github.com/<owner>/<repo>/releases/download/<version>/<asset>'
+Ok '已启用 GitHub 镜像（gh-proxy.com）下载 NSIS/WiX 工具'
+
 Push-Location $frontend
 try {
     if ($cargoTauri) {
