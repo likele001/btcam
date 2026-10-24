@@ -4,6 +4,7 @@
  */
 
 import { useAppStore } from '@/state/app-store';
+import { APP_EDITION, APP_VERSION } from '@/version';
 
 const CONNECTION_TEXT: Record<string, string> = {
   connecting: '连接中',
@@ -26,6 +27,9 @@ export function StatusBar(): JSX.Element {
       <span className="status-item">计算进程 {health?.workers ?? '-'}</span>
       <span className="status-sep" />
       <span className="status-message" title={message}>{message}</span>
+      <span className="status-sep" />
+      {/* 版本角标：用户报障时报这一串，技术支持能直接对上是哪个包 */}
+      <span className="status-version" title={`前端 ${APP_VERSION}`}>{APP_EDITION}</span>
     </footer>
   );
 }

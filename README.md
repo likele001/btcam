@@ -13,6 +13,9 @@
 - 存储：**SQLite**（WAL 模式），本地单文件数据库
 - 工单：**本地快照存档**（图形/板材/摆料/刀具/刀路/后处理/加工文件路径），按名称与日期检索，可重复打开编辑
 - 日志与告警：**内存环形缓冲**（默认 1000 条）+ 结构化查询接口；图形校验异常与任务失败即时弹窗，不靠用户盯控制台
+- 余料管理（V0.2）：排板后的整块剩余区域入库，下一张工单可直接拿它当板材，在余料轮廓内继续排零件
+- 后处理可视化编辑器（V0.3）：软件内改 G/HPGL/DXF 模板，边改边预览，保存即对导出生效
+- MES 对接（V0.4，可选）：拉工单、回传用料统计与加工文件；离线自动旁路，不影响 CAM 任何功能
 - 通信：**WebSocket 长连接 + 自定义二进制帧**，图形点数据零 JSON
 
 ---
@@ -56,9 +59,11 @@ btcam/
 │  │  │  ├─ routes_geometry.py       # /api/geometry/*（模块 2 几何运算）
 │  │  │  ├─ routes_layout.py         # /api/layout/*（模块 3 手动排料 + 模块 4 自动排料）
 │  │  │  ├─ routes_tools.py          # /api/tools /api/templates（模块 6 刀具库与工艺模板）
-│  │  │  ├─ routes_post.py           # /api/post（模块 7 后处理配置 CRUD）
+│  │  │  ├─ routes_post.py           # /api/post（模块 7 CRUD + 模块 11 变量/校验/预览）
 │  │  │  ├─ routes_workorders.py     # /api/workorders（模块 8 工单：快照/检索/恢复/另存）
 │  │  │  ├─ routes_logs.py           # /api/logs（模块 9 日志查询/清空/前端异常上报）
+│  │  │  ├─ routes_scrap.py          # /api/scrap（模块 10 余料库 / 剩余区域 / 设为板材）
+│  │  │  ├─ routes_mes.py            # /api/mes（模块 12 配置/拉单/回传/日志，可选件）
 │  │  │  └─ routes_cam.py            # /api/offset /api/nest /api/toolpath /api/export
 │  │  ├─ core/
 │  │  │  ├─ protocol.py              # ★ 二进制帧协议唯一真源（与前端 protocol.ts 对齐）
@@ -83,17 +88,23 @@ btcam/
 │  │  │  ├─ toolpath_service.py      # ★ 刀路：内外轮廓/补偿/方向/起割点/微连接/排序/分层
 │  │  │  ├─ tool_service.py          # ★ 刀具库/工艺模板：校验/等效直径/参数优先级/顺逆铣映射
 │  │  │  ├─ work_order_service.py    # ★ 工单：快照采集/恢复/检索/另存/加工文件归档
+│  │  │  ├─ scrap_service.py         # ★ 模块10：剩余区域差集/余料入库/设为板材/解绑
 │  │  │  ├─ export_service.py        # 导出兼容层：format -> 内置后处理映射（渲染已移到 post/）
 │  │  │  └─ state.py                 # 最近一次刀路/排料结果的进程内缓存
 │  │  ├─ post/                       # ★ 后处理（模块 7）：一台机床一份 JSON，渲染不碰几何
 │  │  │  ├─ builtin.py               # 6 份内置模板：维宏/新代/山龙/绘图仪/裁割/通用 DXF
 │  │  │  ├─ registry.py              # ★ 注册表：落盘/版本升级/占位符白名单/内置只读保护
 │  │  │  ├─ renderer.py              # ★ G 代码 & HPGL 渲染（行号/精度/换刀/Y 翻转）
+│  │  │  ├─ editor.py                # ★ 模块11：变量字典/逐字段校验/假刀路预览渲染
 │  │  │  ├─ dxf_writer.py            # ezdxf 写回原始图形（图层 + true_color）
 │  │  │  └─ service.py               # 文件名清洗/时间戳/多板 S1 标记/落盘
+│  │  ├─ mes/                        # ★ 模块12（可选件）：离线时整包不参与 CAM 主链路
+│  │  │  ├─ settings.py              # 配置（app_setting 的 mes.config）/ 密钥掩码 / 厂商路径
+│  │  │  ├─ client.py                # urllib 客户端：Bearer+X-Api-Key / 指数退避 / multipart
+│  │  │  └─ service.py               # 拉单归一化 / 用料统计 / 回传归档 / 导出后自动推送
 │  │  └─ models/
 │  │     ├─ geometry.py              # Polyline / Layer / GeometryDoc（numpy float32）
-│  │     ├─ db.py                    # SQLite schema + CRUD（WAL）
+│  │     ├─ db.py                    # SQLite schema + CRUD（WAL）：含 scrap / mes_* 表
 │  │     └─ schemas.py               # REST 请求/响应模型（camelCase）
 │  ├─ requirements.txt               # 后端依赖清单
 │  └─ sidecar.py                    # PyInstaller 打包入口（freeze_support + 起 uvicorn）
@@ -111,7 +122,7 @@ btcam/
 │  │  │  ├─ geometry-layer.ts        # Pixi Graphics 绘制（图层颜色/选中高亮/虚线/菱形标记）
 │  │  │  └─ selection.ts             # bbox 排除 + 顶点包含 + Liang-Barsky 线段相交
 │  │  ├─ state/app-store.ts          # zustand：连接/图形/选中/任务/视图模式
-│  │  ├─ ui/                         # Toolbar / Viewport / 各面板 / ToolLibrary / PostPanel / WorkOrderPanel / LogPanel / AlertDialog / TaskPanel
+│  │  ├─ ui/                         # Toolbar / Viewport / 各面板 / ToolLibrary / PostPanel / PostEditor / ScrapPanel / MesPanel / WorkOrderPanel / LogPanel / AlertDialog / TaskPanel（动作层统一放 use*Actions.ts）
 │  │  ├─ types/geometry.ts           # 前端几何类型
 │  │  ├─ styles/global.css           # 深色工业风主题
 │  │  ├─ App.tsx / main.tsx
@@ -143,6 +154,9 @@ btcam/
    ├─ post_test.py                   # ★ 模块7 验收：服务层 10 项 + 接口 7 项
    ├─ workorder_test.py              # ★ 模块8 验收：服务层 7 项 + 接口 8 项
    ├─ log_alert_test.py              # ★ 模块9 验收：服务层 6 项 + 接口/WS 6 项
+   ├─ scrap_test.py                  # ★ 模块10 验收：余料 38 项（剩余区域/入库/当板材/解绑）
+   ├─ post_editor_test.py            # ★ 模块11 验收：编辑器 23 项（变量/校验/预览/改模板导出生效）
+   ├─ mes_test.py                    # ★ 模块12 验收：MES 62 项（自带假 MES：配置/拉单/回传/离线/自动推送）
    └─ smoke_test.py                  # ★ 端到端自检：REST + WS 二进制 + 任务 + 三种导出
 ```
 
@@ -175,6 +189,9 @@ btcam/
 > 打包前必须先有 `frontend\src-tauri\backend\cam-backend.exe`。
 > 它由 `scripts\build_sidecar.ps1` 生成，`scripts\build.ps1` 会自动串起来。
 > 只想出便携 exe、不生成安装包：`cargo tauri build --no-bundle`。
+>
+> 完整的出包流程、版本号固化清单、验收用例见 **[docs/PACKAGING.md](docs/PACKAGING.md)**；
+> 现场安装、首次启动注意事项、MES 配置、DeepNest 部署见 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**。
 
 ### 4.2 首次准备（只做一次）
 
@@ -264,8 +281,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 1. `build.rs` 构建期读 `backend\cam-backend.exe`，生成 `embedded_backend.rs`（`include_bytes!` + FNV-1a 哈希）；
 2. 字节成为 `btcam.exe` 的一部分，所以 `tauri.conf.json` 的 `bundle.resources` **故意留空**，安装目录不再多一份后端；
-3. 首次启动把内嵌字节写到 `%LOCALAPPDATA%\BtCAM\bin\cam-backend-<hash>.exe`（同哈希只写一次），再以隐藏窗口拉起；
-4. 代价是主程序体积 ≈ 前端 + Rust + 后端（当前后端 23.6 MB），换的是“零安装、单文件、不怕误删后端”。
+3. 首次启动把内嵌字节写到 `%LOCALAPPDATA%\com.btsoft.btcam\bin\cam-backend-<hash>.exe`（Tauri 应用数据目录，目录名 = `identifier`；同哈希只写一次），再以隐藏窗口拉起；
+4. 代价是主程序体积 ≈ 前端 + Rust + 后端（当前后端 25.3 MB），换的是“零安装、单文件、不怕误删后端”。
 
 ### 5.4 进程回收三道保险
 
@@ -278,7 +295,36 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ### 5.5 体积优化
 
 `Cargo.toml [profile.release]`：`opt-level=3` + `lto=true` + `codegen-units=1` + `panic="abort"` + `strip="symbols"` + `incremental=false`。
-后端侧 `--onefile` 自带压缩；OCCT 会显著增大体积，暂时不需要高精度圆弧时可先 `install_backend.ps1 -SkipOcct` 再打包。
+
+后端侧两条：
+
+1. `--onefile` 自带压缩，且 `build_sidecar.ps1` 对从未被 import 的开发依赖统一加 `--exclude-module`
+   （tkinter/PIL/matplotlib/pandas/scipy/PyQt/PySide/IPython/jupyter/pytest/pip/wheel/vtkmodules），
+   避免分析工具把开发期才用的包带进产物；打包后用 `PYZ-00.toc` 可核对 `pip`、`tkinter` 等条目为 0。
+2. **OCCT 默认不打进包**：`cadquery-ocp` 的 `OCP` 是单个 110 MB 扩展模块，`--collect-submodules` 对它无效；
+   默认包（约 25 MB）走 pyclipper，功能完整；需要 OCCT 精度时：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\build_sidecar.ps1 -WithOcct   # 约 130 MB
+   ```
+
+   `-WithOcct` 会自动改用 `--hidden-import OCP` 并保留 `vtkmodules`；打完看自检行的「几何引擎」应是 `occt`。
+
+### 5.6 版本固化（V0.4）
+
+发布版本 `0.4.0`，对外展示名 `V0.4 完整版`。版本号分布在 5 个文件，**必须同步**：
+
+| 文件 | 字段 | 作用 |
+| --- | --- | --- |
+| `frontend/src/version.ts` | `APP_VERSION` / `APP_EDITION` | 关于页、状态栏角标、WS HELLO |
+| `frontend/package.json` | `version` | 前端构建标识 |
+| `frontend/src-tauri/tauri.conf.json` | `version` | 安装包/exe 文件版本，`build.ps1` 用它命名产物 |
+| `frontend/src-tauri/Cargo.toml` | `package.version` | 主程序 crate 版本 |
+| `backend/app/version.py` | `__version__` / `EDITION` | `/api/health` 与启动日志 |
+
+关于页在工具栏「关于…」：展示 `V0.4 完整版`、前端/后端版本、几何/排料引擎、数据目录、已交付 12 模块。
+生产包关闭了 WebView 开发者工具（[`tauri.conf.json`](frontend/src-tauri/tauri.conf.json) 的 `devtools=false` +
+`tauri` crate 无 devtools feature），排障统一走软件内「日志…」面板。
 
 ---
 
@@ -392,6 +438,9 @@ magic uint32 = 0x31434742 ("BGC1") | version u16 | reserved u16 | polyCount u32
 | POST | `/api/post` | 新建自定义后处理 |
 | PUT | `/api/post/{id}` | 修改自定义后处理（内置返回 400，需另存为） |
 | DELETE | `/api/post/{id}` | 删除自定义后处理（内置返回 400） |
+| GET | `/api/post/variables` | 变量字典：12 个占位符 + 各 kind 的指令槽位与中文标签 |
+| POST | `/api/post/validate` | 校验后处理草稿 → `errors[]`（带 `field`，前端据此高亮）/ `warnings[]` / 变量用量 |
+| POST | `/api/post/preview` | 用一条假刀路渲染预览文本（与导出共用同一渲染器） |
 | GET | `/api/workorders` | 工单检索：`keyword`（名称/编号/备注）+ `dateFrom` / `dateTo` + `limit` |
 | GET | `/api/workorders/{id}` | 工单详情（统计 + 刀路/后处理 + 刀具引用 + 缺失提示 + 文件列表） |
 | GET | `/api/workorders/{id}/files` | 工单加工文件列表 |
@@ -403,6 +452,23 @@ magic uint32 = 0x31434742 ("BGC1") | version u16 | reserved u16 | polyCount u32
 | GET | `/api/logs` | 日志查询：`level`（最低级别）/ `keyword` / `source`（前缀）/ `after`（增量游标）/ `limit` |
 | DELETE | `/api/logs` | 清空内存缓冲（不动磁盘日志） |
 | POST | `/api/logs/client` | 前端异常上报（`error` 级自动推 ALERT 帧） |
+| GET | `/api/scrap` | 余料列表：`keyword`（名称/编号/物料）+ `limit`，带当前绑定的 `currentScrapId` |
+| POST | `/api/scrap` | 新建余料（`outline` 为空时用宽高生成矩形） |
+| GET | `/api/scrap/{id}` | 单块余料（含轮廓点串） |
+| PUT | `/api/scrap/{id}` | 修改余料（轮廓可一起改，宽高/面积由后端重算） |
+| DELETE | `/api/scrap/{id}` | 删除余料；正在被板材引用时自动解绑 |
+| POST | `/api/scrap/remaining` | 计算当前板材的剩余区域（预览，不落库）：`minArea` / `gap` |
+| POST | `/api/scrap/save` | 把 `indices[]` 选中的区域入库（几何以后端重算为准） |
+| POST | `/api/scrap/{id}/apply` | 把余料设为当前板材（`resetPlacements` 默认 true） |
+| POST | `/api/scrap/clear` | 解绑余料退回矩形板（可同时套用新尺寸） |
+| GET | `/api/mes/settings` | MES 配置（密钥掩码）+ 厂商清单 + 默认路径 + 工单计数 |
+| PUT | `/api/mes/settings` | 保存 MES 配置（`apiKey` 留空 = 沿用旧值） |
+| POST | `/api/mes/test` | 测试连接（可带草稿配置，未启用也能先试通） |
+| POST | `/api/mes/pull` | 从 MES 拉工单（`limit` 1~200），返回 `created/updated/skipped/problems` |
+| GET | `/api/mes/orders` | 本地 MES 工单列表（`status` = `pulled` / `archived`） |
+| GET | `/api/mes/orders/{id}` | 单张 MES 工单详情（含零件清单） |
+| POST | `/api/mes/push` | 回传工单信息 + 用料统计 + 加工文件归档 |
+| GET | `/api/mes/logs` | MES 交互日志（`orderId` / `limit`） |
 | WS | `/ws` | 图形同步 + 任务推送（**只收二进制帧**） |
 
 ---
@@ -1571,7 +1637,421 @@ B6 用真实 WS 连接验证 `0x50` 帧的 meta 与接口返回的 `id` 一致�
 
 ---
 
-## 十六、配置项（环境变量）
+## 十六、余料管理（模块 10）
+
+排完一块板，剩下的料不该当废料扔掉。模块 10 把「板上还用得上的整块区域」算出来存进余料库，
+下一张工单直接把它当板材，在余料轮廓里继续排零件。
+
+### 16.1 目标与边界
+
+- **算**：板材 − 已摆零件（按最小间距外扩）→ 若干可用区域，pyclipper 求差集，前端不做任何几何判断
+- **存**：轮廓点串、包围盒宽高、净面积、板厚/物料/编号落 SQLite 的 `scrap` 表
+- **用**：把余料设为当前板材（`layout_sheet.scrap_id` 记绑定），手动排料 / 自动排料 / 刀路 / 导出全部复用既有链路
+- 余料轮廓就是**真实可用边界**：设板材时 `margin` 强制归零，再内缩一圈等于白白浪费
+- 不做：余料拼接、跨工程共享（余料按 `project_id` 隔离）、条码/二维码标签
+
+### 16.2 数据模型
+
+`scrap` 表（`models/db.py`）关键列：
+
+| 列 | 说明 |
+| --- | --- |
+| `outline` | JSON `[[x,y],...]`，**板材坐标**的闭合多边形（首点不重复） |
+| `width` / `height` | 包围盒尺寸，就是「当板材」时的板面尺寸 |
+| `area` | 轮廓净面积 mm²（pyclipper `Area` 算出，不是宽×高） |
+| `source` | `layout` 从排料板抠出来 / `manual` 手工录一块方料 |
+| `source_order_id` | 出处工单（当前写 0，给「这张单剩下的料」预留） |
+| `code` / `material` / `thickness` | 贴标编号 / 物料 / 板厚 |
+
+`layout_sheet` 增加 `scrap_id INTEGER NOT NULL DEFAULT 0`（0 = 普通矩形板），
+老库由 `_migrate()` 补列，`load_sheet()` 一并读出，排料 meta 里叫 `scrapId`。
+
+### 16.3 后端：剩余区域怎么算
+
+`services/scrap_service.py` 的核心四步：
+
+1. `_boundary_of(state)`：板材矩形按四边 `margin` 内缩 → SUBJECT
+2. `_obstacles(state, gap)`：每块**已摆放**零件取旋转后包围盒，按 `gap/2` 外扩（相邻两件之间正好留一个间距）→ CLIP
+3. `Clipper.Execute(CT_DIFFERENCE)` → `_simplify()` 去共线点 → 丢掉小于 `minArea` 的碎块 → 按面积降序、最多 30 块
+4. 只把 `index` 回给前端；`save_regions()` 会**重新算一遍**再按 index 取，绝不信任前端回传的轮廓（防手改与版本错位）
+
+`apply_to_sheet()` 把余料设为板材：宽高取包围盒、`margin=0`、写 `scrap_id`，然后清空摆放重做初始行排；
+落在轮廓外的零件不删，统一停靠到板外上方（`_park_outside`），与自动排料「未排下」的表现一致。
+
+真正的越界判定仍在 `layout_service._check` 里：它读到 `sheet.scrapId` 就去取轮廓，用 pyclipper 判断零件是否**整块**落在轮廓内，
+所以 L 形余料的缺口、斜边都能拒绝（验收 D 系列就是这个用例）。
+
+### 16.4 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/scrap` | 列表：`keyword`（名称/编号/物料）+ `limit`，带 `currentScrapId` |
+| POST | `/api/scrap` | 新建（`outline` 为空时用宽高生成矩形，手工录料用） |
+| GET | `/api/scrap/{id}` | 单块余料（含轮廓） |
+| PUT | `/api/scrap/{id}` | 修改；宽高与面积由后端从轮廓重算 |
+| DELETE | `/api/scrap/{id}` | 删除；**正被板材引用时自动解绑**，不留幽灵轮廓 |
+| POST | `/api/scrap/remaining` | 剩余区域预览（`minArea` / `gap`），不落库 |
+| POST | `/api/scrap/save` | 把 `indices[]` 选中的区域入库 |
+| POST | `/api/scrap/{id}/apply` | 设为当前板材（`resetPlacements` 默认 true） |
+| POST | `/api/scrap/clear` | 解绑回矩形板（可同时套用新尺寸） |
+
+### 16.5 前端
+
+| 文件 | 职责 |
+| --- | --- |
+| `ui/ScrapPanel.tsx` | 余料库列表（搜索/选用/编辑/删除）+「计算剩余区域」勾选区（面积/尺寸/点数）+ 保存表单；顶部显示当前板材是否绑着余料 |
+| `ui/useScrapActions.ts` | 全部动作与请求；选用余料后拉排料快照，把轮廓交给画布 |
+| `render/geometry-layer.ts` | 余料边界叠加层：橙色描边 + 半透明填充，缺料区从「空白」变成「明确不可用」 |
+| `ui/Toolbar.tsx` | 「余料…」入口 |
+| `ui/LayoutPanel.tsx` | 板材区显示余料绑定状态与「解绑」按钮 |
+
+画布只按后端给的点串画线，不做任何包含/相交判断 —— 所有几何结论都来自后端。
+
+### 16.6 控制台验收
+
+```powershell
+# 只跑服务层（不需要后端，秒级）
+backend\.venv\Scripts\python.exe scripts\scrap_test.py
+
+# 服务层 + HTTP 全链路（后端需先启动在 8975）
+backend\.venv\Scripts\python.exe scripts\scrap_test.py --url http://127.0.0.1:8975
+```
+
+实测输出（**38/38**，节选）：
+
+```text
+== A. 余料入库 / 检索 ==
+  [OK]   A1 手工矩形余料  手工方块 · 800×600 · 面积 480000 · 4 点
+  [OK]   A2 轮廓归一化  首点 [0.0, 0.0] · 800×400
+  [OK]   A4 非法轮廓拒绝  点不足/面积为零都抛 ScrapError
+== B. 排板后的剩余区域 ==
+  [OK]   B1 剩余区域非空  2 块 · 可用 2564660 mm² · 板 2976800 mm²
+  [OK]   B4 勾选落库  测试余料 10-24 07:37-1 · 1200×2420 · 521 点
+  [OK]   B5 非法勾选拒绝  空选 / 过期 index 都抛 ScrapError
+== C. 余料当板材 ==
+  [OK]   C2 余量归零并绑定 id  margin=0.0 · scrapId=24
+  [OK]   C4 meta 下发余料  boundaryArea=2549085 mm²
+== D. L 形余料边界判定 ==
+  [OK]   D1 L 形余料当板材  包围盒 1000×1000 · 面积 640000 mm²（缺口 600×600 不可用）
+  [OK]   D3 缺口内拒绝  零件「示例零件-2」超出余料轮廓（请放到余料范围内）
+  [OK]   D5 轮廓内通过  落位 (20,700)
+  [OK]   D6 板框外拒绝  零件「示例零件-2」超出板材右边界（可用宽度 1000.0mm）
+== E. 复用排料接口：在余料内自动排料 ==
+  [OK]   E1 确实排上了零件  5 落位 / 0 未排下 · 19 ms
+  [OK]   E2 落位件全在余料轮廓内  5 件全部在轮廓内（含缺口避让）
+== F. 解绑 / 删除 / 工单快照 ==
+  [OK]   F3 打开工单恢复余料绑定  回开后 scrapId=25
+  [OK]   F4 删除在用余料自动解绑  unbound=True · 业务不会挂着幽灵轮廓
+== G. HTTP 接口全链路 ==
+  [OK]   G4 排料 meta 带余料轮廓  轮廓 521 点 · boundaryArea=2549085 mm²
+  [OK]   G6 越界拖拽被拒  零件「示例零件-2」超出板材右边界（可用宽度 1200.0mm）
+
+结果：38 项通过 / 0 项失败 · 用时 0.9s
+```
+
+测试自己造余料、自己清场（删测试余料 + 测试工单并复位板材），不会污染真实数据。
+
+### 16.7 已知取舍
+
+- 剩余区域按**旋转后包围盒**挖洞：凹形零件的凹口不算可用料（保守，宁可少算也不给出放不下的区域）
+- 碎料门槛 `minArea` 默认 1 万 mm²、单次最多 30 块；更细的需求请直接手工录料
+- 余料**不跨工程**：`project_id` 隔离，换工程看不到别工程的料
+- 余料当板材后还能再抠余料，链式复用没有层数限制，但也没有「余料树」追溯（只留 `source_order_id` 占位）
+
+---
+
+## 十七、后处理可视化编辑器（模块 11）
+
+机床模板不该靠改代码。模块 11 在软件内直接编辑 G 代码 / HPGL / DXF 模板，一边改一边看渲染结果，
+保存后立即对导出生效。
+
+### 17.1 目标与边界
+
+- 编辑器只处理**字符串与表单**：模板行、指令槽位、数值参数；校验与渲染全在后端
+- 变量字典、指令槽位、字段约束都由 `/api/post/variables` 下发，前端不硬编码
+- 预览用一条**示例刀路**（宽 > 高的矩形走一圈）渲染，与导出共用同一个 `renderer.render()`
+- 内置 6 份模板只读，改内置必须换 id「另存为」；自定义模板落 `%LOCALAPPDATA%\BtCAM\post\<id>.json`
+- 不做：G 代码语义仿真、机床在线通信（DNC）
+
+### 17.2 变量与指令槽位
+
+12 个占位符（`post/editor.py::VARIABLES`，与 `registry.PLACEHOLDERS` 白名单同源）：
+
+| 组 | 变量 |
+| --- | --- |
+| 任务 | `{name}` 任务名 · `{date}` 生成时间 · `{programNo}` 程序号 |
+| 机床 | `{tool}` 刀号 · `{spindle}` 转速 · `{safeZ}` 安全高度 |
+| 坐标 | `{x}` · `{y}` · `{z}` · `{feed}` |
+| 刻绘 | `{speed}` · `{force}`（HPGL 的 VS / FS） |
+
+槽位随 `kind` 变化，前端按分组自动生成编辑区：
+
+| kind | 槽位 |
+| --- | --- |
+| `gcode` | `header` / `footer` / `toolChange` + `rapidZ` / `rapidXY` / `plungeZ` / `feed` / `cutXY` |
+| `hpgl` | `header` / `footer` / `penUp` / `penDown` / `penLift` |
+| `dxf` | `version`（无模板文本，导出由 ezdxf 直接写） |
+
+指令槽位**必填**（缺了整段刀路会静默消失），`header/footer` 这类行模板允许为空。
+输出花括号本身写 `{{` / `}}`。
+
+### 17.3 校验：errors 拦保存，warnings 只提醒
+
+`post/editor.validate()` 返回 `ok / builtin / errors[] / warnings[] / usedVariables / unusedVariables / unknownVariables`，
+每条错误带 `field`（如 `gcode.cutXY`、`gcode.precision`），前端据此高亮对应输入框。
+
+拦保存的：内置 id 撞名、id 格式、名称空/超 64 字、`kind` 非法、`ext` 非法、槽位为空、
+单行超 2000 字、未知占位符、括号不配对、数值越界（`precision` 0~6、HPGL `unitsPerMm` 等）。
+
+只提醒的：程序尾没有 `M30/M02`、没有 `M5/M05` 停主轴、头尾没引用 `{safeZ}`、
+开了行号却有 `%` 开头行、HPGL 收尾没有 `SP0`。
+
+### 17.4 预览渲染
+
+`POST /api/post/preview` 的 `options` 是假数据（`sizeMm/depth/feed/safeZ/spindle/tool/flipY/speed/force/programNo`），
+后端夹到合理区间后构造示例刀路，再走 `registry.normalize()` + `renderer.render()` —— 与导出**完全同一条路径**，
+所以「预览对了，导出就对了」。校验不通过的草稿返回空文本，不拿半成品误导用户。
+
+### 17.5 前端
+
+| 文件 | 职责 |
+| --- | --- |
+| `ui/PostEditor.tsx` | 三栏：左=元信息 + 指令槽位；中=模板行编辑（等宽字体、逐行错误）；右=变量面板 + 预览（行数/字节数/复制） |
+| `ui/usePostEditorActions.ts` | 拉变量字典、防抖校验、预览、保存/另存为/删除，错误按 `field` 归并 |
+| `ui/postDrafts.ts` | 纯函数：内置模板 → 可编辑草稿（自动换 id）、槽位默认值补齐 |
+| `ui/PostPanel.tsx` | 列表页新增「编辑 / 新建模板」入口 |
+
+输入即校验（400ms 防抖），`errors.length > 0` 时保存按钮禁用；warnings 用黄色条目列在下方，不拦保存。
+
+### 17.6 控制台验收
+
+```powershell
+backend\.venv\Scripts\python.exe scripts\post_editor_test.py
+backend\.venv\Scripts\python.exe scripts\post_editor_test.py --url http://127.0.0.1:8975
+```
+
+实测输出（**23/23**，节选）：
+
+```text
+== A. 服务层：变量字典 / 校验 / 预览 ==
+  [OK]   A1 变量字典  12 个占位符
+  [OK]   A4 未知占位符  gcode.header[9]: 使用了未知占位符 {foo}
+  [OK]   A5 括号不配对  gcode.header[9]: 模板括号不配对：expected '}' before end of string
+  [OK]   A6 空指令  gcode.cutXY: gcode.cutXY 不能为空
+  [OK]   A7 数值范围  gcode.precision: precision 必须是 0~6 的整数
+  [OK]   A8 工艺警告  2 条警告：程序尾没有 M30/M02 结束指令…
+  [OK]   A10 G 代码预览  20 行 / 191 字节
+  [OK]   A11 预览参数  sizeMm=200 -> X200；flipY -> Y-60
+  [OK]   A12 HPGL 预览  11 行
+  [OK]   A13 DXF 预览  DXF 后处理没有模板文本：导出时由 ezdxf 直接写图形文件
+== B. 接口：校验 / 预览 / 改模板导出生效 ==
+  [OK]   B3 校验错误  gcode.cutXY: 使用了未知占位符 {nope}
+  [OK]   B4 预览接口  20 行 / 187 字节
+  [OK]   B5 改模板保存导出  EDITOR_TEST_20261024_073757.nc（870 字节）
+  [OK]   B6 再改再导出  EDITOR_TEST_20261024_073758.nc（1085 字节）
+  [OK]   B7 内置保护  id: 内置后处理不可直接修改，请另存为自定义后处理
+  [OK]   B9 删除  删除后 GET -> HTTP 404
+
+== 结果：23/23 通过 ==
+```
+
+B5/B6 是这条模块的核心验收：**改模板 → 保存 → 导出**，两次文件字节数不同，说明改动真的进了渲染器，
+而不是只改了配置。测试结束会删掉临时模板（`EDITOR_TEST_*`）与导出文件。
+
+### 17.7 已知取舍
+
+- 校验只到**语法/结构级**：知道占位符在白名单、括号配对、数值越界，但不判断某台机床是否接受这条 G 代码
+- 预览只跑示例刀路，不读当前工程真实几何（快、与几何解耦，但看不到多板 `S1` 这类批量效果）
+- 单行模板上限 2000 字符、预览上限 20 万字符，超出**截断而非拒绝**（避免前端卡死）
+- 没有模板版本历史/回滚，保存即生效；要留底就「另存为」不同 id
+
+---
+
+## 十八、MES 对接接口（模块 12，可选）
+
+车间已经有 MES 的厂，工单信息不该手工录两遍。模块 12 把 MES 的工单拉到本地，再把 CAM 的产出
+（工单信息 + 用料统计 + 加工文件）回推归档。**它是可选件**：不开启时一条网络请求都不发，CAM 全部功能照旧。
+
+### 18.1 目标与边界
+
+- 支持 CenkorMes / LightMes / 自定义（路径可逐条改）
+- **拉**：单号、名称、客户、物料、板厚、交期、零件清单 → `mes_order`（按 `remote_id` 幂等 upsert）
+- **推**：工单信息 + 用料统计（零件数/轮廓数/摆放数/利用率/板尺寸/文件数/字节数）+ 加工文件（multipart）
+- 开关 / 厂商 / 地址 / 密钥 / 超时 / 重试 / 自动推送 / 是否带文件，全在设置页配
+- **隔离**：`app/mes/*` 不被 CAM 核心 import；导出钩子延迟 import + `try/except` + daemon 线程
+- 不做：MES 侧排程/报工/物料扣减、双向状态机同步、离线队列补传（推送失败只留日志，不排队）
+
+### 18.2 配置与数据表
+
+配置存 `app_setting` 表 `key='mes.config'` 一条 JSON（明文落库，出接口只给掩码）：
+
+| 键 | 说明 |
+| --- | --- |
+| `enabled` | 总开关；关闭时拉单/回传直接 400 |
+| `vendor` | `cenkor` / `lightmes` / `custom` |
+| `baseUrl` | `http(s)://host[:port][/prefix]` |
+| `apiKey` | 同时放 `Authorization: Bearer` 与 `X-Api-Key`；出接口掩码为 `sk****cdef`，**留空 = 沿用旧值** |
+| `timeout` | 0.5~60 秒 |
+| `retries` | 0~5 次（总尝试 = retries + 1） |
+| `autoPush` | 导出成功后自动回传 |
+| `includeFiles` | 回传是否带加工文件 |
+| `paths` | 覆盖厂商默认路径（`ping` / `orders` / `archive`） |
+
+厂商默认路径：
+
+| 厂商 | 探活 | 拉单 | 归档 |
+| --- | --- | --- | --- |
+| CenkorMes | `/api/v1/ping` | `/api/v1/workorders` | `/api/v1/workorders/{remoteId}/archive` |
+| LightMes | `/api/ping` | `/api/workorders` | `/api/workorders/{remoteId}/archive` |
+| 自定义 | 默认同 Cenkor，可逐条覆盖 | | |
+
+数据表：
+
+| 表 | 说明 |
+| --- | --- |
+| `mes_order` | `remote_id` 唯一索引；`status` = `pulled` / `archived`；`parts` / `payload` 存 JSON；`part_count` 是冗余计数 |
+| `mes_push_log` | 动作 / 成功标记 / 尝试次数 / HTTP 状态码 / 文案，排障用 |
+
+老库缺 `part_count` 时 `_migrate()` 自动补列并按 `parts` 的 `qty` 回填；表名沿用旧版 `mes_push_log`，升上来的库不断历史记录。
+
+### 18.3 客户端与重试
+
+`mes/client.py` 只用标准库 `urllib`（不新增依赖）：
+
+- 错误统一成 `MesError(message, status_code, attempts)`；`_detail_of()` 依次取 `detail/message/error/msg`，把服务端 JSON 翻成人话
+- **可重试**：`408/425/429/500/502/503/504`，退避 `min(2.0, 0.25×2^(n-1))` 秒；401/403/400/404 立即失败（密钥错了重试只会锁账号）
+- **multipart 手搓**：`payload` 字段放 JSON，`file_1..file_N` 放二进制，boundary 每次随机
+- `limit` 拼查询串时按已有 `?` 决定分隔符，`baseUrl` 末尾斜杠自动归一
+- `User-Agent: BtCAM/0.1 (+module12)`，方便 MES 侧识别来源
+
+### 18.4 拉单
+
+`GET {orders}?limit=N` → `_extract_orders()` 认 `orders/data/list/records/items` 这类常见外壳 → 逐条 `_normalize_order()`：
+
+- 单号依次尝试 `orderId / order_id / orderNo / order_no / code`；一个都没有就**跳过并留原因**，不中断整批
+- 零件清单认 `parts/items/components/details/partList`，零件名认 `name/partName/partNo/no`；字符串零件也接受
+- `partCount` 按每条 `qty/quantity/count` 累加（没有则记 1）
+- upsert 只刷新业务字段与 `pulledAt`，**不会把已 `archived` 的单打回 `pulled`**（重复拉单不丢归档状态）
+
+### 18.5 回传归档
+
+`POST {archive}`，payload 示例：
+
+```json
+{
+  "remoteId": "WO-1001",
+  "source": "BtCAM",
+  "status": "archived",
+  "idempotencyKey": "70-20261024073757",
+  "pushedAt": "2026-10-24T07:37:57",
+  "usage": {
+    "partCount": 12, "polylineCount": 34, "placementCount": 12,
+    "utilization": 0.7321, "sheetWidth": 1220, "sheetHeight": 2440,
+    "fileCount": 2, "fileBytes": 58
+  },
+  "workOrder": { "id": 70, "code": "WO-1001", "name": "…", "stats": { } },
+  "notes": "CAM 导出完成"
+}
+```
+
+`orderId` 不给 `workOrderId` 时，用 `work_order.code == remoteId` 自动配本地工单（编号就是约定）。
+有文件走 multipart、没文件走 JSON；成功后置 `archived` + 时间戳，并写一条日志。
+
+### 18.6 自动推送旁路
+
+`routes_cam._record()` 在导出成功、登记加工文件之后调 `_notify_mes(project_id, workOrderId)`：
+
+1. **同步预检**（开关 + 地址 + `autoPush` + 编号非空），不满足直接返回 false，零网络开销
+2. 满足则起 `threading.Thread(name="mes-auto-push", daemon=True)` 去推
+3. 整段 `try/except`，任何异常只记 debug 日志
+
+所以 MES 挂掉/断网时，导出接口的返回与耗时**完全不受影响**（验收 E 系列断言：关闭开关后假 MES 请求数为 0）。
+
+### 18.7 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/mes/settings` | 配置（密钥掩码）+ 厂商清单 + 默认路径 + `orderCount/archivedCount/lastLog` |
+| PUT | `/api/mes/settings` | 保存配置（`apiKey` 留空 = 沿用） |
+| POST | `/api/mes/test` | 试连接；可带草稿配置，未启用也能先试通 |
+| POST | `/api/mes/pull` | 拉单（`limit` 1~200），返回 `created/updated/skipped/problems` |
+| GET | `/api/mes/orders` | 本地 MES 工单列表（`status` 过滤） |
+| GET | `/api/mes/orders/{id}` | 单张详情（含零件清单） |
+| POST | `/api/mes/push` | 回传归档 |
+| GET | `/api/mes/logs` | 交互日志（`orderId` / `limit`） |
+
+错误口径：400（未启用 / 配置不合法 / 数据认不出）、404（工单不存在）、502（MES 不可达，`detail` 带「已尝试 N 次」）。
+
+### 18.8 前端
+
+| 文件 | 职责 |
+| --- | --- |
+| `ui/MesPanel.tsx` | 三个页签：连接（开关/厂商/地址/密钥/超时/重试/自动推送/带文件 + 测试连接）、工单（拉单 + 列表 + 详情零件清单 + 手动回传）、日志（动作/结果/尝试次数/状态码） |
+| `ui/useMesActions.ts` | 打开时拉配置与列表；保存/测试/拉单/回传/刷新动作 |
+| `ui/Toolbar.tsx` | 「MES…」入口；开关关闭时按钮仍在（离线也能看已拉的工单） |
+
+### 18.9 控制台验收
+
+```powershell
+# 服务层：自带假 MES，不需要真的 MES 服务
+backend\.venv\Scripts\python.exe scripts\mes_test.py
+
+# 服务层 + HTTP 接口全链路
+backend\.venv\Scripts\python.exe scripts\mes_test.py --url http://127.0.0.1:8975
+```
+
+`mes_test.py` 用 `ThreadingHTTPServer` 起一个假 MES（`/api/v1/ping`、`/api/v1/workorders`、
+`/api/v1/workorders/{id}/archive`，同时校验 Bearer 与 `X-Api-Key`，可注入 503 / 401），
+所以验收不依赖外部环境。实测 **62/62**（节选）：
+
+```text
+[A] 配置：校验 / 密钥 / 往返 / 厂商路径
+  [OK]   A4 非法 vendor  vendor 必须是 cenkor/custom/lightmes 之一
+  [OK]   A9 保存后启用并落掩码  sk****cdef
+  [OK]   A10 密钥留空沿用旧值
+  [OK]   A13 对外 payload 不含明文密钥
+[B] 客户端：鉴权 / 参数 / 重试 / 错误详情
+  [OK]   B2 同时带 Bearer 与 X-Api-Key
+  [OK]   B4 503 指数退避重试后成功  attempts=3
+  [OK]   B5 401 不重试  密钥无效
+[C] 拉单：归一化 / 幂等 / 跳过脏数据
+  [OK]   C1 首次拉单新增 2 张  created=2 updated=0
+  [OK]   C2 脏数据被跳过并留原因  MES 工单缺少单号（id / orderNo / code 都没有）
+  [OK]   C6 零件数按数量累加  3
+  [OK]   C7 重复拉单只更新不新增  created=0 updated=2
+[D] 回传：用料统计 / 文件 / 幂等键 / 归档状态 / 日志
+  [OK]   D3 文件数 / 字节数正确  files=2 bytes=58
+  [OK]   D4 走了 multipart（带文件）
+  [OK]   D5 用料统计来自本地工单快照  {"partCount": 12, "utilization": 0.7321, …}
+  [OK]   D10 本地标记已归档
+  [OK]   D12 关闭文件上传后走 JSON
+[E] 离线：开关关闭时一个包都不发
+  [OK]   E1 未启用时拉单被拒  MES 对接未启用，请先到「MES 对接」打开开关
+  [OK]   E2 一个请求都没发出去  requests=0
+[F] 自动推送：导出后的 daemon 线程
+  [OK]   F2 线程真的把工单推了过去  archives=1
+  [OK]   F4 工单编号为空时跳过
+[G] HTTP 接口全链路
+  [OK]   G9 不存在工单回 404  HTTP 404: {"detail":"MES 工单不存在 #99999999"}
+  [OK]   G10 未启用时回 400  HTTP 400: {"detail":"MES 对接未启用…"}
+  [OK]   G11 MES 路由全部注册  missing=[]
+
+全部通过  62/62 通过
+```
+
+测试前会备份 `mes.config` 并在结束时恢复，同时删掉 `MES-TEST-%` 的工单与日志，不把验收噪音留给下次人工查看。
+
+### 18.10 已知取舍
+
+- 密钥**明文存库**（本机单用户桌面程序），只有接口出参加掩码；要更强隔离得接系统凭据库（未做）
+- 只按 `remoteId` 对单：本地工单编号必须**等于 MES 单号**才能自动关联，否则手动传 `workOrderId`
+- 推送失败**不排队重发**：记一条失败日志，用户可在「工单」页手动重推（幂等键让重复推送安全）
+- 拉单只取「最近 N 张」，不做增量游标（各家 MES 没有统一的时间戳约定）
+- 自动推送是 daemon 线程，程序退出时正在进行的推送可能被中断（下次手动重推即可）
+
+---
+
+## 十九、配置项（环境变量）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -1593,7 +2073,7 @@ B6 用真实 WS 连接验证 `0x50` 帧的 meta 与接口返回的 `id` 一致�
 
 ---
 
-## 十七、OCCT 与 DeepNest 接入
+## 二十、OCCT 与 DeepNest 接入
 
 ### OCCT（2D 几何核心）
 
@@ -1632,7 +2112,7 @@ DeepNest 官方是 JS 实现，本项目通过**外部进程桥接**接入，避
 
 ---
 
-## 十八、依赖清单
+## 二十一、依赖清单
 
 ### 后端（`backend/requirements.txt`）
 
@@ -1672,12 +2152,12 @@ DeepNest 官方是 JS 实现，本项目通过**外部进程桥接**接入，避
 
 ---
 
-## 十九、当前进度与已知限制
+## 二十二、当前进度与已知限制
 
 已跑通并验证：
 
-- **整体联调已通过**：9 个模块串行完成，后端 151 项回归 + 浏览器全流程走查 + 断线重连现场验证全过，详见第二十章
-- 前端 `tsc --noEmit` + `vite build` 零错误（779 模块；业务 120.44 kB，CSS 23.35 kB，pixi 519.41 kB，react 141.61 kB）
+- **整体联调已通过**：9 个基础模块串行完成，后端 151 项回归 + 浏览器全流程走查 + 断线重连现场验证全过，详见第二十三章（模块 10/11/12 在此基础上新增 123 项）
+- 前端 `tsc --noEmit` + `vite build` 零错误（786 模块；业务 164.94 kB，CSS 36.32 kB，pixi 519.41 kB，react 141.61 kB）
 - 后端 9 项端到端自检全过（WS 二进制帧解析、异步进度推送、NC/PLT/CUT 落盘）
 - **模块 1 DXF 导入**：算法 5 项 + 接口 4 项全过（断线闭合/重叠清理/自相交/内外轮廓/碎线/块展开/多零件拆分）
 - **模块 2 几何服务**：服务层 9 项 + 接口 7 项全过（补偿面积误差 <0.01%、偏移后无自交、内外方向正确、求交面积精确、200 次调用 RSS 无增长）
@@ -1688,7 +2168,10 @@ DeepNest 官方是 JS 实现，本项目通过**外部进程桥接**接入，避
 - **模块 7 后处理与导出**：服务层 10 项 + 接口 7 项全过（6 份内置模板落盘且幂等、维宏 G 代码 24 行、新代行号 N10 与 `T7 M6`、2 位精度去尾零、HPGL 40 unit/mm 与 Y 翻转、CUT 的 VS/FS、DXF 写回可读、未知占位符/非法 kind/内置改删四类拒绝；接口自定义 CRUD、`processorId` 导出、DXF 图形导出、两块板批量出 2 个文件、未知后处理 400）
 - **模块 8 工单存档**：服务层 7 项 + 接口 8 项全过（快照顶点 base64 往返一致且不落 ids/选中集、名称/编号/创建日期三类检索、清空工程后重复打开还原板材与摆放、另存深拷贝、加工文件登记、参数白名单清洗、删除连带文件；接口 CRUD、打开后回填刀路深度、真实导出带 `workOrderId` 自动归档、空名称 422 / 未知工单 404 / 非法日期 400）
 - **模块 9 日志与告警**：服务层 6 项 + 接口/WS 6 项全过（环形缓冲满容量淘汰、级别/关键词/来源/增量四类过滤、warning 显式推送与 error 自动推送及 3 秒去重、LogRecord 结构化入环含堆栈且可跳过、进度日志文案去重与节流、导入校验汇总告警；接口查询/清空/前端上报、非法级别 400 / 空消息 422、`0x50` ALERT 帧 meta 与接口返回一致）
-- sidecar 已实测打包：`cam-backend.exe` 23.6 MB，脚本自检 `/api/health` 通过
+- **模块 10 余料管理**（V0.2）：服务层 28 项 + 接口 10 项全过（手工录料/轮廓归一化/非法轮廓拒绝、剩余区域面积降序且不越板边、按 index 入库且拒绝过期索引、余料当板材 `margin` 归零并绑定 `scrapId`、L 形余料缺口与板外拖拽双向拒绝而轮廓内落位通过、在余料内自动排料 5 件全落位、工单快照带余料绑定且重开恢复、解绑回整板、删除在用余料自动解绑）
+- **模块 11 后处理可视化编辑器**（V0.3）：服务层 14 项 + 接口 9 项全过（变量字典 12 个占位符、used/unused/unknown 三类统计、括号不配对/空槽位/数值越界拦截、M30 与 `{safeZ}` 等工艺警告、G 代码/HPGL/DXF 三类预览、预览参数生效（sizeMm/flipY）、错误草稿不出预览；接口「改模板→保存→导出」两次文件字节数不同、内置只读保护、未知 id 404、删除后 404）
+- **模块 12 MES 对接**（V0.4 可选）：服务层 51 项 + 接口 11 项全过（8 类配置校验文案、密钥掩码与留空沿用、Bearer + `X-Api-Key` 同发、503 指数退避 `attempts=3`、401 不重试、拉单脏数据跳过与按数量累加、重复拉单只更新、回传 multipart 带文件与幂等键、用料统计取自工单快照、归档状态与交互日志、关闭带文件走 JSON、离线零请求、导出后 daemon 自动推送、7 条路由全注册）
+- sidecar 已实测打包：`cam-backend.exe` 23.6 MB，脚本自检 `/api/health` 通过（V0.4 精简依赖后实包 25.29 MB，见 [docs/PACKAGING.md](docs/PACKAGING.md) 实测基线）
 - 分片双端验证：单帧 139,756 B → 140 片；用前端真实 `protocol.ts` 重组，轮廓/点数与原始一致
 - 进程回收实测：杀掉伪父进程后，源码态 4 s 内退出、打包态两层进程 0 残留、端口释放
 
@@ -1699,15 +2182,15 @@ DeepNest 官方是 JS 实现，本项目通过**外部进程桥接**接入，避
 3. 自动排料内置底线扫描；DeepNest 只提供桥接协议与外部命令接口，未内置桥接程序（未配置时自动回退）
 4. DXF 导入已支持 LINE/多段线/圆/弧/椭圆/样条/块/HATCH；**DWG 未支持**（需另接转换）
 5. 刀路已覆盖内外轮廓、微连接、起割点、排序、Z 分层与圆弧切入；**没有过切/残料检查，也没有 G 代码仿真**，实际加工前需空跑验证；后处理只负责出文件，**不含机床在线通信（DNC）**
-6. **模块 9（日志告警）已完成**，V0.1 的 9 个模块全部就绪；MES/ERP 对接（V0.4）不在本次范围。全量回归全过（dxf 9 / geometry 16 / layout 22 / auto_nest 19 / toolpath 13 / tool_library 19 / post 17 / workorder 15 / log_alert 12 / smoke 9，共 151 项）
+6. **模块 9（日志告警）已完成**，V0.1 的 9 个模块全部就绪；在此基础上又完成了 **模块 10 余料管理（V0.2）、模块 11 后处理可视化编辑器（V0.3）、模块 12 MES 对接（V0.4 可选）**。全量回归全过（dxf 9 / geometry 16 / layout 22 / auto_nest 19 / toolpath 13 / tool_library 19 / post 17 / workorder 15 / log_alert 12 / scrap 38 / post_editor 23 / mes 62 / smoke 9，共 274 项）
 
 ---
 
-## 二十、整体联调验收（V0.1）
+## 二十三、整体联调验收（V0.1）
 
 九个模块全部完成后做的一次全链路联调：**后端脚本回归 + 浏览器内真实 UI 操作 + 断线重连现场验证**。
 
-### 20.1 联调环境
+### 23.1 联调环境
 
 | 项 | 值 |
 | --- | --- |
@@ -1716,16 +2199,18 @@ DeepNest 官方是 JS 实现，本项目通过**外部进程桥接**接入，避
 | 数据目录 | `%LOCALAPPDATA%\BtCAM`（SQLite + post 配置 + exports + logs） |
 | 说明 | 本机未装 Rust，`cargo tauri dev` 不可用；浏览器与 Tauri 同为 Chromium 内核，UI 行为一致，差异只在窗口外壳 |
 
-### 20.2 后端全量回归
+### 23.2 后端全量回归
 
-10 个验收脚本、共 151 项，全部通过（改动后各跑一遍，结果一致）：
+V0.1 阶段：10 个验收脚本、共 151 项，全部通过（改动后各跑一遍，结果一致）。
+模块 10/11/12 加入后补跑三份新脚本，共 13 个脚本 / 274 项：
 
 ```
 dxf_import 9 · geometry 16 · layout 22 · auto_nest 19 · toolpath 13
 tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
+scrap 38 · post_editor 23 · mes 62
 ```
 
-### 20.3 UI 全流程走查
+### 23.3 UI 全流程走查
 
 按真实操作顺序点一遍，全程控制台 **0 error、0 失败请求**：
 
@@ -1743,7 +2228,7 @@ tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
 | 10 | 后处理切换 | 6 个内置模板，切到维宏后「速度/压力/Y 翻转」字段自动隐藏 |
 | 11 | 前端异常上报 | 注入 `ErrorEvent` → 状态栏「错误：…」+ `POST /api/logs/client` 200 + 日志面板出现 `frontend` 来源记录 |
 
-### 20.4 断线重连现场验证
+### 23.4 断线重连现场验证
 
 后端被强制结束后由脚本自动拉起，前端全程不刷新：
 
@@ -1756,7 +2241,7 @@ tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
 
 结论：断线 10 s 内可感知、恢复 20 s 内自愈、几何不丢、工具栏可用。
 
-### 20.5 联调中发现并修复的问题
+### 23.5 联调中发现并修复的问题
 
 | 问题 | 根因 | 修复 |
 | --- | --- | --- |
@@ -1768,7 +2253,7 @@ tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
 
 复测结果：左面板保持「图层」、画布 3 色保留、状态栏「偏置完成：9 条轮廓」；「自动排料完成：5 个零件已落位」；勾选框 15×15 单行不换行；8 个数字输入 `validity.valid` 全为 true、`stepMismatch` 全为 false。
 
-### 20.6 仍然存在的小问题（不阻塞交付）
+### 23.6 仍然存在的小问题（不阻塞交付）
 
 1. 窗口宽度小于 1080 px 时（`body{min-width:1080px}`），模态框会按 `min(1000px, 100vw-72px)` 收缩，日志面板内容被挤成竖排；Tauri 默认窗口远大于此，浏览器小窗下才会遇到
 2. 日志面板打开期间每 2 s 轮询一次 `GET /api/logs`；改为 WS 推送可省请求，但面板关闭后就不该推，权衡后保持轮询
@@ -1777,7 +2262,7 @@ tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
 
 ---
 
-## 二十一、故障排查
+## 二十四、故障排查
 
 | 现象 | 处理 |
 | --- | --- |
@@ -1817,3 +2302,203 @@ tool_library 19 · post 17 · workorder 15 · log_alert 12 · smoke 9
 | 日志被进度刷屏 | 进度日志已按 1.5s / 8% 节流；`BTCAM_LOG_LEVEL=WARNING` 可只留警告以上 |
 | 前端报错弹窗反复出现 | 同文案 3 秒内只推一次、前端 5 秒内只上报一次；若持续提示说明是重复触发的真实错误 |
 | 中文出口乱码 | 后端已强制 UTF-8；控制台请用 Windows Terminal |
+| 点「计算剩余区域」报“当前工程没有零件” | 空板没有“剩余”可言：先导入 DXF 或排料，再算余料 |
+| 余料当板材后零件跑到板外上方 | 正常：换板后旧摆放失效，统一停靠板外；点「自动排料」重落位，或手动拖回轮廓内 |
+| 拖零件总提示“超出余料轮廓” | 余料可能是 L 形/带缺口：面积够不等于轮廓里放得下，换小件或换规则料 |
+| 余料列表里看不到刚存的料 | 余料按 `project_id` 隔离；确认当前工程，或清空搜索关键词再刷新 |
+| 删了余料后板材变回矩形 | 设计如此：正在被板材引用的余料删除时自动解绑，避免幽灵轮廓 |
+| 后处理改完预览没变化 | 校验未通过时预览不出文本；先看红色错误条目，改成 `ok` 再预览 |
+| 后处理保存按钮点不动 | `errors` 未清零；黄色 warnings 只是工艺提醒，不拦保存 |
+| 想改内置后处理 | 内置只读：在编辑器里换一个 id「另存为」，内置模板保持不动 |
+| 预览与导出内容不一样 | 预览跑的是示例刀路（100×60 矩形），导出读真实刀路；两者共用同一渲染器，差异来自坐标/行数 |
+| MES 测试连接报“（已尝试 N 次）” | 地址/端口不对或 MES 不可达；401/403 不重试，先去设置页核对地址与密钥 |
+| MES 拉单报“缺少单号” | MES 返回里没有 `orderId/orderNo/code`，需 MES 侧确认接口字段；该条会被跳过并列入 `problems` |
+| 导出后 MES 没收到回传 | 检查开关 + `autoPush` + 工单编号是否等于 MES 单号；到「MES… → 日志」页看失败原因 |
+| 断网时还能用 CAM 吗 | 能：开关关闭时一条请求都不发；自动推送是 daemon 线程 + 全程 `try/except`，不影响导出返回与耗时 |
+
+---
+
+## 二十五、V0.1 全链路联调与上机测试用例
+
+12 个模块全部完成后的一次整体联调：**自动化脚本跑一遍全链路 + 重启复核持久化 + Tauri 窗口内手工走查**。
+所有验证都在软件窗口内完成，没有生成任何浏览器调试页面。
+
+### 25.1 跑法
+
+```powershell
+# 1) 主流程：导入 → 排料 → 刀路 → 余料复用 → 自定义后处理 → 工单 → MES 闭环（38 项）
+backend\.venv\Scripts\python.exe scripts\e2e_test.py --url http://127.0.0.1:8975
+
+# 2) 重启软件后复核数据没丢（3 项，复核完自动删探针）
+backend\.venv\Scripts\python.exe scripts\e2e_test.py --url http://127.0.0.1:8975 --verify
+
+# 3) 13 个模块回归脚本（274 项）
+foreach($s in @('smoke_test','dxf_import_test','geometry_ops_test','layout_test','auto_nest_test',
+  'toolpath_test','tool_library_test','post_test','post_editor_test','workorder_test',
+  'log_alert_test','scrap_test','mes_test')) {
+  backend\.venv\Scripts\python.exe "scripts\$s.py" --url http://127.0.0.1:8975 }
+```
+
+`e2e_test.py` 自带一个**假 MES**（标准库 `ThreadingHTTPServer`，随机端口），不依赖外网；
+结束时会恢复 MES 配置与板材参数，只留工单/余料/刀具模板三个探针给 `--verify` 复核，复核完自行删除。
+重跑时会先按 `E2E` 名字前缀清掉上次的残留，不会污染用户库。
+
+### 25.2 本轮修复清单
+
+| # | 现象 | 根因 | 修复位置 | 验证 |
+| --- | --- | --- | --- | --- |
+| 1 | 绑定余料后点「复位」，零件落进余料缺口；`overflowCount` 仍报 0 | `reset()` 只做矩形行排；`build_meta` 越界统计只看矩形板框 | `layout_service.reset/park_outside/_outside_boundary/build_meta` | e2e D4（轮廓内 0 / 越界 2 · overflowCount=2） |
+| 2 | 换余料板与「复位」两套停靠口径，结果不一致 | 停靠算法在两处各写一份 | `scrap_service._park_outside` 委托 `layout_service.park_outside(check_gap=True)`，`PARK_OFFSET=10` 统一板外间距 | e2e D3/D4 + scrap 38 项 |
+| 3 | 连续排料/刀路后任务表只增不减 | `TaskQueue._tasks` 无上限，完成记录永不淘汰 | `core/tasks.py`：`MAX_TASK_RECORDS=400` + `_prune_tasks()`（排队/运行中不淘汰） | smoke / log_alert 回归 |
+| 4 | 拔网线/休眠后 WS 连接挂在 hub 里越积越多 | 半开连接收不到 FIN，`receive_bytes` 永久阻塞 | 服务端 `IDLE_TIMEOUT_SEC=90` 空闲断开；客户端 `DEAD_AFTER_MS=45` 无回帧主动重连 | 手工断网 + `hub.client_count` 回归 |
+| 5 | MES 单与本地工单是否关联看不出来，直接回传会没有用料与文件 | 关联只存在于 `work_order.code == remoteId` 的隐式约定 | `mes/service` 输出 `localWorkOrder`/`linkedCount`；前端列表/详情加关联徽标 + 「按单号新建工单」 | e2e F2/F3 |
+| 6 | 导出/文件登记失败时日志没有上下文，跨模排查困难 | 异常日志只带异常本身 | `routes_cam` 日志补 工程 / 后处理 / 工单 / 板 号 | e2e G1~G3（按 `source` 分类可查） |
+| 7 | 凹形余料上点「自动排料」整批 0 落位（P-1） | `ScanPacker._candidates()` 只给「板内左下角 + 已放件右上角」；余料板 `margin=0` 时 `(0,0)` 落在缺口里，候选集只剩一个无效点 | `nest_service.ScanPacker._boundary_candidates()`：把轮廓顶点及其「顶左 / 压底」投影加进候选（网格只当去重键，坐标不四舍五入），规则板不产生额外候选 | e2e D5（轮廓内 2 / 越界 0） |
+| 8 | 未排下件的停靠位置两套口径（P-2） | `nest_service` 用 `height+margin` 停靠，`layout_service.park_outside` 用 `height+PARK_OFFSET` | 统一走 `PARK_OFFSET`（左端贴 0、上方留 10mm），与复位/换板完全一致 | auto_nest A6 + scrap E3 + e2e D4/D5 |
+
+### 25.3 已验证无问题的项
+
+| 检查项 | 验证方式 | 结论 |
+| --- | --- | --- |
+| OCCT 内存泄漏 | 200 次偏移后看进程 RSS | 无增长（`ReleaseScope` + 显式 `gc`） |
+| DeepNest 子进程残留 | 排料中途取消 × 多次后查进程表 | 无残留（`finally: kill/wait/join`，轮询里感知取消） |
+| WS 长连接堆积 | 反复开关窗口 + 强杀后端 | `hub` 用 set + 广播失败剔除，`finally` 摘除；空闲超时兜底 |
+| 后处理改模板是否实时生效 | 改模板 → 立刻导出对比文本 | 生效（registry 每次读盘，无缓存） |
+| 坏 DXF 是否拖垮进程 | 上传 1 个坏文件 | 任务 `failed`，进程存活，已有图形原样保留 |
+| MES 离线是否影响 CAM | 关闭开关后复位/导出 | 零网络请求，`400` 明确提示，CAM 功能正常 |
+| 关重启是否丢数据 | 重启后端后按 id 回读工单/余料/模板 | 全部一字不差（e2e `--verify` 3/3） |
+
+### 25.4 余料排料的两个遗留问题（本轮已修）
+
+原先记录为"不阻塞交付、需产品决策"的两项，在 V0.1 收尾时已修复并回归：
+
+**P-1 凹形余料上自动排料排不上件（已修复）**
+
+- 现象：把带缺口/L 形余料设为板材后点「自动排料」，零件全部停靠到板外（0 落位）。
+- 根因：`nest_service.ScanPacker._candidates()` 只生成「板内左下角 `(margin,margin)` + 已放件右上角」两类候选点。
+  换到余料板时 `margin=0`，而 `(0,0)` 正好落在余料缺口里，候选集就只剩这一个无效点，搜索无从落脚。
+- 修复：新增 `_boundary_candidates()`，把余料轮廓顶点以及「顶到左边 `(margin,by)`」「压到底边 `(bx,margin)`」两条投影加入候选集。
+  每个候选仍由 `LayoutService._check` 复验，所以多给候选不会误放；`boundary is None` 的规则板完全不产生额外候选，
+  排序结果与改造前逐字一致（同一组零件仍落在 `(10,10) / (615,10) / (870,10)`）。
+- 实现细节（踩过的坑）：布尔差生成的轮廓是圆弧近似（一次剩余区域就是 173 个点），必须去重，
+  但**网格只能当去重键，坐标不能四舍五入** —— 把 `(600.038, 402.5)` 挪成 `(600, 402)` 会落进缺口，
+  产生一个看着贴边、实际越界 1.35 mm² 的"合法"候选（正好压在 `_inside` 的 1 mm² 容差内，肉眼与统计都看不出来）。
+  现状：网格按 1 mm 去重（不够再放到 4/10 mm），保留每组首个点的原始坐标，候选数上限 600。
+- 验证：e2e D5 由"0 落位 + 安全不变式"升级为"至少 1 件进轮廓 + 安全不变式"，实测 2 件全部落在轮廓内
+  （`(0,402.5)` 与 `(605,402.5)`，正好压在缺口上沿）；离线单测另覆盖 L 形缺角 300×300、93 点多顶点、
+  100×100 放不下四种场景，越界数均为 0。
+
+**P-2 未排下件的停靠间距两套口径（已修复）**
+
+`nest_service` 原来用 `sheet.height + margin` 停靠（余料 `margin=0` 时贴着板边），`layout_service.park_outside` 用 `PARK_OFFSET=10`。
+现已统一为 `PARK_OFFSET`：左端贴 0、上方留 10 mm，换板自动停靠与自动排料"未排下"落在同一位置，用户看到的是同一个口径。
+
+**仍然存在的小事（不影响功能）**
+
+- `_inside` 的 1 mm² 面积容差是有意保留的（圆角外扩与浮点让"刚好贴边"差几个 0.01 mm²）：
+  理论上允许约 1 mm² 的越界，肉眼与切缝都无影响；收紧容差会让大量贴边摆放被误拒，故不动。
+
+### 25.5 上机测试用例
+
+前置：`scripts\run_backend.ps1` 已启动后端（状态栏「已连接」），数据目录干净或已备份。
+「预期」列即判定标准，任一项不符就停下取证（截图 + 日志面板 + `%LOCALAPPDATA%\BtCAM\logs\backend.log`）。
+
+#### A 组 · DXF 导入（模块 1）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| A-1 | 导入一张正常板件 DXF（含内孔） | 任务面板 `DXF 导入 完成`；画布出现轮廓、内孔为不同颜色；零件数 = 图形中闭合外框数 |
+| A-2 | 同一张图再导一次（勾「替换」） | 图形不重复累加，零件数不变；旧摆放被清理 |
+| A-3 | 导入一个改名成 `.dxf` 的文本文件 | 任务「失败」并给出中文原因；软件不崩、已有图形不变 |
+| A-4 | 一次选 5 个 DXF 批量导入 | 5 个文件都进任务列表，逐个出结果；单个失败不影响其余 |
+| A-5 | 导入含断线/自交的脏图 | 能自动修复的修复并给告警；修不了的记 `open_contour` / `self_intersection` 告警，不阻塞入库 |
+
+#### B 组 · 手动排料 + 自动排料（模块 3/4）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| B-1 | 进入排料模式 | 零件自动行排，每个都有位置；状态栏显示板材尺寸与零件数 |
+| B-2 | 拖动零件松手 | 合法落位后画布不弹回；越界/间距不足则弹回并提示具体原因（左/右/上/下/与某件间距不足） |
+| B-3 | 旋转 90°、锁定、锁定木纹各一次 | 旋转后包围盒中心不偏移；锁定后拖不动；木纹锁定后自动排料也不再转它 |
+| B-4 | 改板材为 1220×2440 / 余量 10 / 间距 5 | 越界件被夹回可用区域，`overflowCount` 与实际越界件数一致 |
+| B-5 | 点「自动排料」，再点「取消」 | 任务进入 `cancelled` 终态且没有 `running` 残留；取消后画布仍是最后一次落库的位置 |
+| B-6 | 连续自动排料 5 次 | 每次耗时稳定、结果不越界；任务列表不会无限增长（上限 400 条） |
+| B-7 | 未配置 `BTCAM_DEEPNEST_CMD` 时点自动排料 | 回退内置扫描并记一条 warning（符合设计，不是错误） |
+
+#### C 组 · 刀路与后处理（模块 5/6/7）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| C-1 | 生成刀路（外轮廓 + 内孔，带微连接） | 任务完成；画布绿实线切削、虚线空走、起割点可见；点数/层数合理 |
+| C-2 | 绑定刀具库里的刀再生成 | 直径/进给/方向由刀具接管，面板对应字段变灰 |
+| C-3 | 套用工艺模板再生成 | 补偿方向、微连接宽度按模板生效 |
+| C-4 | 导出 NC / PLT / CUT 各一次 | 文件落盘、日志记录字节数；NC 首尾是 `%`、`M30`；PLT 首尾 `IN;`/`SP0;` |
+| C-5 | 勾「全部板材」导出 | 一块板一个文件，文件名带板序号 |
+| C-6 | 切割深度 18 / 每层 3 | 刀路分 6 层下刀，每层 Z 递减、最后到 −18 |
+
+#### D 组 · 余料复用（模块 10）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| D-1 | 排完一块板后点「计算剩余区域」 | 列出可用碎块（按面积从大到小），勾选后能存进余料库 |
+| D-2 | 把余料设为当前板材 | 板材尺寸=余料包围盒、余量归 0、画布边界画成余料轮廓而非矩形 |
+| D-3 | **绑定余料后点「复位」** | 放不进轮廓的零件停靠到板外上方；`overflowCount` = 越界件数（本轮修复点） |
+| D-4 | 在余料轮廓内拖一个零件到缺口位置 | 被拒绝并提示「超出余料轮廓」 |
+| D-5 | 余料板上点「自动排料」 | 排得上的整块落在轮廓内、排不上的整块停靠板外；**不会出现跨在缺口上的件**（见 P-1 遗留项） |
+| D-6 | 删掉正在当板材的余料 | 自动退回矩形整板，不会拿着幽灵轮廓继续判定 |
+| D-7 | 解绑余料 | 退回矩形板并恢复原余量，`scrapId=0` |
+
+#### E 组 · 自定义后处理编辑器（模块 11）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| E-1 | 「后处理…」里复制内置模板另存为自定义 id | 保存成功，列表出现新模板且标记为自定义 |
+| E-2 | 在头部加一行 `( TEST-1 )` 后**直接导出** | 导出的文件里立刻出现 `TEST-1`（改模板即时生效，无需重启） |
+| E-3 | 把 `cutXY` 改成 `G01 X{x} Y{y} {nope}` 再保存 | 保存被拦：字段 `gcode.cutXY` 报「未知占位符 {nope}」 |
+| E-4 | 把 `cutXY` 清空 | 报「cutXY 不能为空」（槽位必填，否则刀路会静默少一半） |
+| E-5 | 预览与导出对比 | 预览文本与导出文件结构一致（共用同一渲染器，仅坐标不同） |
+| E-6 | 删除自定义模板后再导出 | 导出报「后处理 #xxx 不存在」并提示刷新列表；内置模板不可删 |
+
+#### F 组 · 工单与持久化（模块 8）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| F-1 | 保存工单（当前工程带余料绑定） | 工单详情里零件数/轮廓数/利用率正确，余料绑定一并存进快照 |
+| F-2 | 打开工单后再导出，导出时带工单 | 加工文件自动登记到该工单（详情「文件」页可见，含格式与字节） |
+| F-3 | 先解绑余料，再「打开」这张工单 | 余料绑定被恢复，画布边界回到余料轮廓 |
+| F-4 | 另存为 / 改名 / 删除 | 另存为生成新单不影响原单；删除连带清文件记录 |
+| F-5 | **关闭软件再启动，重新打开该工单** | 零件、摆放、板材、余料、刀具与模板引用、后处理选择全部原样恢复 |
+
+#### G 组 · MES 工单闭环（模块 12）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| G-1 | 设置页填地址/密钥 → 测试连接 | 连通返回服务器信息；地址错报「已尝试 N 次」；401/403 不重试 |
+| G-2 | 点「拉取工单」 | 列表出现 MES 单；重复拉取只有一条（按单号幂等），本地状态不丢 |
+| G-3 | 未建本地工单时看列表 | 关联徽标显示「未建本地工单」；顶部统计 `linkedCount` 为 0 |
+| G-4 | 点「按单号新建工单」 | 生成 `code = MES 单号` 的本地工单，徽标变「已关联工单 #id」 |
+| G-5 | 排料 + 刀路 + 导出后点「回传」 | MES 收到 `usage`（零件数/利用率）+ 加工文件；本地单标记 `archived`，日志页有成功记录 |
+| G-6 | 关掉 MES 开关再点回传 | 返回 400「MES 对接未启用」，且**一个网络请求都不发** |
+| G-7 | 开关关闭状态下做导入/排料/刀路/导出 | 全部正常，无告警弹窗，日志里没有 MES 相关报错 |
+| G-8 | 回传时 MES 宕机 | 报 502 并带尝试次数；本地工单、文件、数据都不受影响（可稍后重试） |
+
+#### H 组 · 异常容错与资源（模块 2/4/9）
+
+| 编号 | 操作 | 预期 |
+| --- | --- | --- |
+| H-1 | 排料/刀路进行中强杀后端 | 前端状态栏 4 s 内转「已断开」，指数退避重连；后端拉起后自动恢复并重新同步图形 |
+| H-2 | 拔网线/让机器休眠 2 分钟后唤醒 | 服务端 90 s 空闲断开半开连接；客户端 45 s 无回帧主动重连，`clients` 计数不虚高 |
+| H-3 | 反复开关窗口 10 次 | 后端 `clients` 归零，任务队列无线程泄漏 |
+| H-4 | 排料中途取消，再立刻排料 | 无残留子进程（任务管理器看不到 DeepNest），CPU 回落 |
+| H-5 | 任务失败（坏 DXF / 非法模板） | 前端弹窗为中文业务原因；日志面板能按 `level`/`source` 区分 业务 / 几何 / 外部服务 |
+| H-6 | 看日志来源分类 | `app.services.*`=业务，`app.geometry*`/`occt`=几何，`app.mes*`=外部 MES，`app.core.tasks`=任务，`frontend`=前端异常 |
+
+### 25.6 本轮实测结果
+
+| 项 | 结果 |
+| --- | --- |
+| `e2e_test.py` 主流程 | **38/38 通过**（P/A/B/C/D/E/F/G 七段，用时 5.4 s） |
+| `e2e_test.py --verify`（重启后） | **3/3 通过**（工单 #99 / 余料 #56 · 173 点 / 模板 #59 全部原样读回，探针已清理） |
+| 13 个模块回归脚本 | **274/274 通过**，0 失败（含 auto_nest 19 项、scrap 38 项复跑） |
+| 前端 `tsc --noEmit` / `vite build` | 0 错误；786 modules，7.1 s |
+| 联调后清理 | 临时日志/探针脚本已删；工单、余料、模板、MES 缓存中 `E2E` 残留均为 0 |

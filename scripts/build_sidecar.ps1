@@ -6,11 +6,16 @@
 #
 # 用法: powershell -ExecutionPolicy Bypass -File scripts\build_sidecar.ps1
 #       powershell ... build_sidecar.ps1 -Clean     # 先清 build 目录再打
+#       powershell ... build_sidecar.ps1 -WithOcct  # 连 OCCT 绑定一起打（+110MB）
 #
 # 六步：环境检查 -> 依赖探测 -> PyInstaller -> 产物校验 -> 启动自检 -> 注入资源目录
 # ============================================================
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    # 是否把 OCCT 绑定（OCP / pythonocc-core）打进后端。
+    # 默认不带：OCP 是单个 110MB 的 .pyd，且 onefile 每次启动都要解包，
+    # 生产包体积会从 ~24MB 跳到 ~130MB；不带时自动降级 pyclipper，功能完整。
+    [switch]$WithOcct
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,8 +124,10 @@ try {
 Ok ("Python " + $envInfo.python)
 
 $occt = $envInfo.occt
-if ($occt) {
-    Ok "OCCT 绑定 $occt（会一并打包，注意 onefile 体积会明显变大）"
+if ($occt -and $WithOcct) {
+    Ok "OCCT 绑定 $occt（已按 -WithOcct 一并打包，产物会明显变大）"
+} elseif ($occt) {
+    Warn "检测到 OCCT 绑定 $occt，但默认不打包（+110MB）；要 OCCT 精度请加 -WithOcct"
 } else {
     Warn '未检测到 OCC / OCP：本次产物只带 pyclipper 几何引擎，功能可用，圆弧精度略低'
 }
@@ -148,7 +155,32 @@ $pyi = @(
     '--collect-submodules', 'websockets',
     '--collect-submodules', 'pyclipper'
 )
-if ($occt) { $pyi += @('--collect-submodules', $occt) }
+
+# 开发/无关依赖排除：业务代码从未 import 这些包（后端只用 fastapi/uvicorn/
+# numpy/pyclipper/ezdxf），但它们常见于分析工具的传递依赖里。
+# PyInstaller 只会在“真的被分析到”时少拷一份，不影响任何已用到的库。
+# vtkmodules 是 OCCT 可视化的依赖，只有在 -WithOcct 时保留。
+$excludes = @(
+    'tkinter', '_tkinter', 'turtle', 'turtledemo',
+    'PIL', 'matplotlib', 'mpl_toolkits',
+    'pandas', 'scipy', 'sklearn',
+    'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
+    'IPython', 'jupyter', 'notebook', 'nbformat', 'nbconvert',
+    'pytest', '_pytest',
+    'pip', 'wheel'
+)
+if (-not $WithOcct) { $excludes += 'vtkmodules' }
+foreach ($name in $excludes) { $pyi += @('--exclude-module', $name) }
+
+if ($occt -and $WithOcct) {
+    if ($occt -eq 'OCP') {
+        # cadquery-ocp 的 OCP 是单文件扩展模块（OCP.cpXX-win_amd64.pyd，~110MB），
+        # 不是包，--collect-submodules 对它无效，必须 --hidden-import 才能进包
+        $pyi += @('--hidden-import', 'OCP')
+    } else {
+        $pyi += @('--collect-submodules', 'OCC')
+    }
+}
 if ($envInfo.deepnest) { $pyi += @('--collect-submodules', 'deepnest') }
 $pyi += $entry
 
