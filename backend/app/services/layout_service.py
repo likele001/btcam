@@ -44,6 +44,14 @@ MIN_OVERLAP_AREA = 1e-3
 PARK_OFFSET = 10.0
 # 复制零件时沿原件右侧/下方外推的候选步数（再多就交给停靠区，避免拖慢响应）
 COPY_SCAN_STEPS = 8
+# 新建零件时板内扫描的网格上限（行 x 列）：新建是单件操作，扫太密只会让响应变慢
+SCAN_MAX_ROWS = 40
+SCAN_MAX_COLS = 40
+# 圆用正多边形近似时的分段数：切割路径本来就是折线，段数够多看起来就是圆
+CIRCLE_SEGMENTS = 64
+# 作图新建的轮廓单独归一个图层：将来导回图纸时一眼能看出是手画的
+SHAPE_LAYER_NAME = "作图"
+SHAPE_LAYER_COLOR = 0xFFB020
 
 
 # ---------------------------------------------------------------- 数据结构
@@ -261,7 +269,11 @@ class LayoutService:
 
     # ------------------------------------------------------------ 初始化
     def open(self, conn: Any, project_id: int) -> LayoutState:
-        """进入排料模式：没有摆放记录时按行排做一次初始摆放。"""
+        """进入排料模式：没有摆放记录时按行排做一次初始摆放。
+
+        追加导入（replace=false）或手工新建零件后，会出现"有零件但没摆放记录"，
+        这里一并补摆，否则它们只在数据库里、画布上永远看不见。
+        """
         state = self.load(conn, project_id)
         if not state.parts:
             return state
@@ -272,7 +284,36 @@ class LayoutService:
                 rot=float(p["rot"]), locked=bool(p["locked"]), zorder=int(p["zorder"]),
                 fixed_rot=bool(p.get("fixedRot", False)),
             ) for pid, p in db.load_placements(conn, project_id).items()}
+        else:
+            self._place_new_parts(conn, state)
         return state
+
+    def _place_new_parts(self, conn: Any, state: LayoutState) -> int:
+        """给还没有摆放记录的零件找位置（追加导入 / 新建零件后补摆）。
+
+        先按网格扫描找板内空位，整板都放不下就停靠到板外上方，
+        与复制零件的口径一致：不静默叠在已有零件上。
+        """
+        pending = [part for part in state.parts if part.id not in state.placements]
+        if not pending:
+            return 0
+        zorder = max((item.zorder for item in state.placements.values()), default=-1) + 1
+        placed = 0
+        for index, part in enumerate(pending):
+            spot = self._scan_spot(state, part, 0.0)
+            if spot is None:
+                tx, ty = self._park_spot(state, part, 0.0)
+            else:
+                tx, ty = spot
+            state.placements[part.id] = Placement(
+                part_id=part.id, sheet=0, tx=tx, ty=ty, rot=0.0,
+                locked=False, zorder=zorder + index)
+            db.save_placement(conn, state.project_id, part.id, 0, tx, ty, 0.0,
+                              locked=False, zorder=zorder + index)
+            placed += 1
+        if placed:
+            logger.info("补摆 %d 个新零件（追加导入/新建）", placed)
+        return placed
 
     def _initial_layout(self, conn: Any, state: LayoutState) -> None:
         """行排初始摆放：高件优先，自下而上逐行摆。
@@ -535,6 +576,193 @@ class LayoutService:
         if next_x > 0 and next_x + width > max(sheet_w, width):
             return 0.0, round(row_y + row_h + gap, 3)
         return round(next_x, 3), round(row_y, 3)
+
+    # ------------------------------------------------------------ 作图新建
+    @staticmethod
+    def shape_points(kind: str, width: float, height: float, diameter: float,
+                     points: Sequence[Sequence[float]],
+                     ) -> Tuple[np.ndarray, str]:
+        """把作图参数转成轮廓点串（板坐标）与默认名称。
+
+        圆用正多边形近似：切割路径本来就是折线，导出/预览/碰撞全按折线走，
+        比存一个"真圆"再到处特判稳得多。
+        """
+        if kind == "rect":
+            if width <= 0 or height <= 0:
+                raise ValueError("矩形的宽和高必须大于 0")
+            pts = np.asarray([[0.0, 0.0], [width, 0.0],
+                              [width, height], [0.0, height]], dtype=np.float64)
+            return pts, f"矩形 {width:g}×{height:g}"
+
+        if kind == "circle":
+            if diameter <= 0:
+                raise ValueError("圆的直径必须大于 0")
+            radius = diameter / 2.0
+            angles = np.linspace(0.0, 2.0 * math.pi, CIRCLE_SEGMENTS, endpoint=False)
+            pts = np.stack([radius + radius * np.cos(angles),
+                            radius + radius * np.sin(angles)], axis=1)
+            return pts, f"圆 Φ{diameter:g}"
+
+        if kind == "polygon":
+            cleaned: List[List[float]] = []
+            for item in points:
+                if len(item) < 2:
+                    continue
+                x, y = float(item[0]), float(item[1])
+                if cleaned and abs(cleaned[-1][0] - x) < EPS and abs(cleaned[-1][1] - y) < EPS:
+                    continue        # 双击闭合时最后一个点和起点重合，去掉
+                cleaned.append([x, y])
+            if len(cleaned) >= 3 and abs(cleaned[0][0] - cleaned[-1][0]) < EPS \
+                    and abs(cleaned[0][1] - cleaned[-1][1]) < EPS:
+                cleaned.pop()
+            if len(cleaned) < 3:
+                raise ValueError("多边形至少需要 3 个点")
+            return np.asarray(cleaned, dtype=np.float64), f"多边形 {len(cleaned)}点"
+
+        raise ValueError(f"不支持的作图类型：{kind}")
+
+    def add_shape(self, conn: Any, project_id: int, kind: str = "rect", name: str = "",
+                  width: float = 0.0, height: float = 0.0, diameter: float = 0.0,
+                  points: Sequence[Sequence[float]] = (),
+                  at: Optional[Sequence[float]] = None) -> LayoutResult:
+        """在排料板上新建一个零件（手动作图）：矩形 / 圆 / 手绘多边形。
+
+        几何按板坐标传进来，这里归一化到自身包围盒左下角（与 DXF 导入件同构）。
+        落位优先级：用户画的位置（at）能用就用 -> 网格扫描找空位 -> 停靠板外上方。
+        """
+        state = self.load(conn, project_id)
+        try:
+            outline, default_name = self.shape_points(kind, width, height, diameter, points)
+        except ValueError as exc:
+            return LayoutResult(False, str(exc), state)
+
+        part_name = (name or "").strip() or default_name
+        min_xy = outline.min(axis=0)
+        local = (outline - min_xy).astype(np.float32)
+        made = self._make_part(0, part_name, [{"pts": local}])
+        if made is None:
+            return LayoutResult(False, "轮廓退化（面积为 0），没法建件", state)
+
+        layer_id = db.ensure_layer(conn, project_id, SHAPE_LAYER_NAME, SHAPE_LAYER_COLOR)
+        bbox = [0.0, 0.0, round(made.width, 3), round(made.height, 3)]
+        new_id = db.create_part(conn, project_id, part_name, "draw", bbox)
+        db.save_part_polylines(conn, project_id, new_id, [(layer_id, True, False, local)])
+
+        part = LayoutPart(id=new_id, name=part_name, contours=made.contours,
+                          width=made.width, height=made.height, outline=made.outline,
+                          outline_index=made.outline_index, area=made.area)
+        state.parts.append(part)
+
+        zorder = max((item.zorder for item in state.placements.values()), default=-1) + 1
+        # 手绘的件就放在用户画的位置：能放下就不挪，放不下才去找空位
+        spot: Optional[Tuple[float, float]] = None
+        if at is not None and len(at) >= 2:
+            wanted = (round(float(at[0]), 3), round(float(at[1]), 3))
+            if not self._check(state, part, 0.0, wanted[0], wanted[1], exclude=part.id):
+                spot = wanted
+        if spot is None:
+            spot = self._scan_spot(state, part, 0.0)
+        parked = spot is None
+        tx, ty = self._park_spot(state, part, 0.0) if parked else spot
+        state.placements[new_id] = Placement(
+            part_id=new_id, sheet=0, tx=tx, ty=ty, rot=0.0, locked=False, zorder=zorder)
+        db.save_placement(conn, project_id, new_id, 0, tx, ty, 0.0,
+                          locked=False, zorder=zorder)
+
+        logger.info("新建零件「%s」（%s，%.1f×%.1f，%s）", part_name, kind,
+                    part.width, part.height, "停靠板外" if parked else "已上板")
+        return LayoutResult(True, "", state, extra={
+            "partId": new_id, "parked": parked, "partIds": [new_id],
+            "width": round(part.width, 3), "height": round(part.height, 3),
+        })
+
+    def update_outline(self, conn: Any, project_id: int, part_id: int,
+                       contours: Sequence[Sequence[Sequence[float]]]) -> LayoutResult:
+        """顶点编辑：用新的轮廓点串替换零件几何。
+
+        点串是"屏幕上看到的坐标"（板坐标，已含摆放与旋转），所以这里直接把它
+        当成 0° 的新轮廓落库，并把摆放位置设为新包围盒左下角 —— 用户拖到哪、
+        切出来就是哪，不会因为旧角度再被旋转一次。
+        木纹锁定件不允许改型：改完角度语义就乱了，得先解纹。
+        """
+        state = self.load(conn, project_id)
+        part = state.part(part_id)
+        placement = state.placements.get(part_id)
+        if part is None or placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+        if placement.locked:
+            return LayoutResult(False, f"零件「{part.name}」已锁定，先解锁再改造型", state)
+        if placement.fixed_rot:
+            return LayoutResult(False, f"零件「{part.name}」锁定了木纹方向，先解纹再改造型", state)
+
+        arrays: List[np.ndarray] = []
+        for item in contours:
+            arr = np.asarray(item, dtype=np.float64).reshape(-1, 2)
+            if len(arr) >= 2 and np.allclose(arr[0], arr[-1]):
+                arr = arr[:-1]
+            if len(arr) < 3 or abs(self._signed_area(arr)) < MIN_OVERLAP_AREA:
+                continue
+            arrays.append(arr)
+        if not arrays:
+            return LayoutResult(False, "轮廓至少需要 3 个不共线的点", state)
+
+        all_pts = np.concatenate(arrays, axis=0)
+        min_xy = all_pts.min(axis=0)
+        local = [(arr - min_xy).astype(np.float32) for arr in arrays]
+        made = self._make_part(part_id, part.name, [{"pts": arr} for arr in local])
+        if made is None:
+            return LayoutResult(False, "新轮廓退化（面积为 0）", state)
+
+        tx, ty = round(float(min_xy[0]), 3), round(float(min_xy[1]), 3)
+        error = self._check(state, made, 0.0, tx, ty, exclude=part_id)
+        if error:
+            return LayoutResult(False, error, state)
+
+        rows = db.load_part_polylines(conn, project_id, part_id)
+        layer_id = int(rows[0]["layer_id"]) if rows else 1
+        areas = [abs(self._signed_area(arr)) for arr in local]
+        outline_idx = int(np.argmax(areas))
+        db.replace_part_polylines(conn, project_id, part_id, [
+            (layer_id, True, index != outline_idx, arr) for index, arr in enumerate(local)
+        ])
+        db.update_part_bbox(conn, project_id, part_id,
+                            [0.0, 0.0, round(made.width, 3), round(made.height, 3)])
+
+        placement.tx, placement.ty, placement.rot = tx, ty, 0.0
+        db.save_placement(conn, project_id, part_id, placement.sheet, tx, ty, 0.0,
+                          placement.locked, placement.zorder,
+                          fixed_rot=placement.fixed_rot)
+        state.parts = [made if item.id == part_id else item for item in state.parts]
+
+        logger.info("改造型「%s」：%d 条轮廓，%.1f×%.1f",
+                    part.name, len(local), made.width, made.height)
+        return LayoutResult(True, "", state, extra={
+            "partId": part_id, "width": round(made.width, 3),
+            "height": round(made.height, 3),
+        })
+
+    def _scan_spot(self, state: LayoutState, part: LayoutPart,
+                   rot: float) -> Optional[Tuple[float, float]]:
+        """板内按行扫描第一个合法位置（新建零件用）；整板放不下时返回 None。"""
+        margin = float(state.sheet["margin"])
+        gap = float(state.sheet["gap"])
+        sheet_w = float(state.sheet["width"])
+        sheet_h = float(state.sheet["height"])
+        width, height = part.size_at(rot)
+        step_x = max(width, 1.0) + gap
+        step_y = max(height, 1.0) + gap
+
+        for row in range(SCAN_MAX_ROWS):
+            y = margin + step_y * row
+            if y + height > sheet_h - margin + EPS:
+                break
+            for col in range(SCAN_MAX_COLS):
+                x = margin + step_x * col
+                if x + width > sheet_w - margin + EPS:
+                    break
+                if not self._check(state, part, rot, x, y, exclude=part.id):
+                    return round(x, 3), round(y, 3)
+        return None
 
     def reset(self, conn: Any, project_id: int) -> LayoutResult:
         """清空摆放并重新做一次初始行排。

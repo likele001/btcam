@@ -36,6 +36,8 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
 
   // 隐藏的文件选择框：Tauri 窗口内弹出原生文件对话框
   const fileRef = useRef<HTMLInputElement | null>(null);
+  // 追加导入用另一个选择框：同一个 input 没法区分“替换/追加”
+  const appendRef = useRef<HTMLInputElement | null>(null);
 
   // 排料模式入口（模块 3）：打开后左侧面板切成板材/零件，画布画板材
   const { open: openLayout, nest } = useLayoutActions();
@@ -97,6 +99,19 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
     });
   };
 
+  /** 追加导入：replace=false，新图纸的零件加进当前工程，已有件与摆料不动 */
+  const onAppendDxf = () => appendRef.current?.click();
+
+  const onAppendSelected = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    if (files.length === 0) return;
+    void guard('追加 DXF', async () => {
+      const result = await api.importDxf(files, { replace: false }, projectId ?? undefined);
+      setMessage(`已提交 ${files.length} 个文件追加导入（${result.taskId}），完成后回排料模式即可看到新零件`);
+    });
+  };
+
   const onOffset = () =>
     guard('轮廓偏置', async () => {
       const result = await api.offset({
@@ -144,8 +159,20 @@ export function Toolbar({ onFit }: ToolbarProps): JSX.Element {
           hidden
           onChange={onDxfSelected}
         />
+        <input
+          ref={appendRef}
+          type="file"
+          accept=".dxf"
+          multiple
+          hidden
+          onChange={onAppendSelected}
+        />
         <button type="button" className="btn btn-accent" onClick={onPickDxf} disabled={busy}>
           导入 DXF
+        </button>
+        <button type="button" className="btn" onClick={onAppendDxf} disabled={busy}
+          title="把新图纸的零件加进当前工程，不清空已有零件（导入按钮会清空）">
+          追加 DXF
         </button>
         <button type="button" className="btn" onClick={onDemo} disabled={busy}>
           载入示例

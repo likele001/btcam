@@ -268,6 +268,36 @@ class LayoutDuplicateRequest(BaseModel):
     count: int = Field(1, ge=1, le=99, description="复制份数（1~99）")
 
 
+class LayoutShapeRequest(BaseModel):
+    """新建零件（排料板作图）。
+
+    三种形状共用一份报文：rect 用 width/height，circle 用 diameter，
+    polygon 用 points（板坐标，由画布手绘时采集）。
+    尺寸上限防止误输入 12 万毫米的零件把画布缩到看不见。
+    """
+
+    projectId: Optional[int] = None
+    kind: str = Field("rect", pattern="^(rect|circle|polygon)$",
+                      description="rect 矩形 | circle 圆 | polygon 手绘多边形")
+    name: str = Field("", max_length=64, description="零件名；留空则按形状自动命名")
+    width: float = Field(100.0, ge=0.0, le=100000.0)
+    height: float = Field(100.0, ge=0.0, le=100000.0)
+    diameter: float = Field(100.0, ge=0.0, le=100000.0)
+    points: List[List[float]] = Field(
+        default_factory=list, description="多边形顶点 [[x,y],...]，板坐标，至少 3 个")
+    at: Optional[List[float]] = Field(
+        None, description="希望摆放的包围盒左下角 [x,y]；手绘时抄用户画的位置，不合法才另找")
+
+
+class LayoutOutlineRequest(BaseModel):
+    """改造型（顶点编辑）：contours 是画布上看到的世界坐标点串。"""
+
+    projectId: Optional[int] = None
+    partId: int
+    contours: List[List[List[float]]] = Field(
+        ..., description="轮廓点串集合：外轮廓 + 内孔，每条至少 3 个点")
+
+
 class LayoutNestRequest(BaseModel):
     """自动排料（模块 4）：在排料板上重排零件。
 

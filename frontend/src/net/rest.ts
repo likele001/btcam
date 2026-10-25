@@ -502,6 +502,30 @@ export interface LayoutDuplicateResult extends LayoutActionResult {
   partIds: number[];
 }
 
+/** 新建零件（作图）的入参：三种形状共用，按 kind 取对应字段 */
+export interface LayoutShapeParams {
+  projectId?: number;
+  kind: 'rect' | 'circle' | 'polygon';
+  /** 零件名；留空则按形状自动命名（矩形 200×100 / 圆 Φ50 / 多边形 N点） */
+  name?: string;
+  width?: number;
+  height?: number;
+  diameter?: number;
+  /** 多边形顶点 [[x,y],...] 板坐标，仅 kind=polygon */
+  points?: Array<[number, number]>;
+  /** 希望摆放的包围盒左下角 [x,y]：手绘时抄用户画的位置，放不下后端再另找 */
+  at?: [number, number];
+}
+
+/** 新建零件的结果：parked=true 表示板上没位置、停靠在板外上方 */
+export interface LayoutShapeResult extends LayoutActionResult {
+  partId: number;
+  parked: boolean;
+  partIds: number[];
+  width: number;
+  height: number;
+}
+
 export interface SheetParams {
   projectId?: number;
   width: number;
@@ -951,6 +975,24 @@ export const api = {
     /** 复制零件（排料板增件）：只传 partId 则加 1 件 */
     duplicate: (payload: { projectId?: number; partId: number; count?: number }) =>
       request<LayoutDuplicateResult>('/api/layout/duplicate', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 新建零件（作图）：矩形/圆/手绘多边形，直接当可排件 */
+    addShape: (payload: LayoutShapeParams) =>
+      request<LayoutShapeResult>('/api/layout/add-shape', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 改造型：提交拖过顶点的轮廓（世界坐标点串，外轮廓 + 内孔） */
+    updateOutline: (payload: {
+      projectId?: number;
+      partId: number;
+      contours: Array<Array<[number, number]>>;
+    }) =>
+      request<LayoutActionResult>('/api/layout/update-outline', {
         method: 'POST',
         body: JSON.stringify(payload),
       }),

@@ -668,6 +668,29 @@ def save_part_polylines(conn: sqlite3.Connection, project_id: int, part_id: int,
     return ids
 
 
+def replace_part_polylines(conn: sqlite3.Connection, project_id: int, part_id: int,
+                          items: List[Tuple[int, bool, bool, Any]]) -> List[int]:
+    """重写一个零件的全部轮廓（顶点编辑用）。
+
+    轮廓 id 会变（删旧写新）：排料帧的轮廓 id 由后端按顺序重新分配，
+    前端只认 part_id，所以这里不必费力保住旧 id。
+    """
+    conn.execute("DELETE FROM polyline WHERE project_id = ? AND part_id = ?",
+                 (project_id, part_id))
+    return save_part_polylines(conn, project_id, part_id, items)
+
+
+def update_part_bbox(conn: sqlite3.Connection, project_id: int, part_id: int,
+                     bbox: List[float], name: Optional[str] = None) -> None:
+    """更新零件包围盒（改造型后重算）；name 传了才一起改。"""
+    if name is None:
+        conn.execute("UPDATE part SET bbox = ? WHERE project_id = ? AND id = ?",
+                     (json.dumps(bbox), project_id, part_id))
+    else:
+        conn.execute("UPDATE part SET bbox = ?, name = ? WHERE project_id = ? AND id = ?",
+                     (json.dumps(bbox), name, project_id, part_id))
+
+
 def load_parts(conn: sqlite3.Connection, project_id: int) -> List[Dict[str, Any]]:
     cur = conn.execute(
         "SELECT id, name, source, bbox, created_at FROM part WHERE project_id = ? ORDER BY id",

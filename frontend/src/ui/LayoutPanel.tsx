@@ -17,6 +17,9 @@ import { useScrapActions } from './useScrapActions';
 /** 与后端 db.py 的 layout_sheet 默认值保持一致 */
 const DEFAULT_SHEET: SheetSpec = { width: 1220, height: 2440, margin: 10, gap: 5 };
 
+/** 作图新建的形状 */
+type ShapeKind = 'rect' | 'circle' | 'polygon';
+
 /** 可编辑的板材数值字段；scrapId 由余料接口维护，不在表单里出现 */
 type SheetNumberKey = 'width' | 'height' | 'margin' | 'gap';
 
@@ -35,8 +38,8 @@ export function LayoutPanel(): JSX.Element {
   const setSelection = useAppStore((s) => s.setSelection);
   const setBusy = useAppStore((s) => s.setBusy);
 
-  const { applySheet, duplicateSelected, rotateSelected, lockSelected, fixedRotSelected, nest,
-    cancelNest, reset } =
+  const { applySheet, duplicateSelected, addShape, rotateSelected, lockSelected, fixedRotSelected,
+    nest, cancelNest, reset } =
     useLayoutActions();
   // 余料（模块 10）：绑定/解绑都走余料接口，轮廓与边界仍由后端提供
   const { open: openScrap, clearSheet } = useScrapActions();
@@ -46,6 +49,14 @@ export function LayoutPanel(): JSX.Element {
   const [rotation, setRotation] = useState(true);
   // 复制份数：选中零件再生成几件同款（上限与后端 schema 的 1~99 对齐）
   const [copies, setCopies] = useState(1);
+  // 作图：形状参数 + 名称；绘制中/顶点编辑中的状态存在 store，画布与面板共用
+  const [shapeKind, setShapeKind] = useState<ShapeKind>('rect');
+  const [shapeName, setShapeName] = useState('');
+  const [shapeSize, setShapeSize] = useState({ width: 200, height: 100, diameter: 100 });
+  const drawingShape = useAppStore((s) => s.drawingShape);
+  const editingPartId = useAppStore((s) => s.editingPartId);
+  const setDrawingShape = useAppStore((s) => s.setDrawingShape);
+  const setEditingPartId = useAppStore((s) => s.setEditingPartId);
   const nesting = tasks.some((task) => task.kind === 'layout_nest'
     && (task.status === 'queued' || task.status === 'running'));
 
@@ -56,6 +67,12 @@ export function LayoutPanel(): JSX.Element {
   useEffect(() => {
     if (layout && !dirty) setSheet(layout.sheet);
   }, [layout, dirty]);
+
+  // 面板被换成别的视图时，把“绘制中/改造型中”一并收掉，避免画布卡在十字准线
+  useEffect(() => () => {
+    useAppStore.getState().setDrawingShape(false);
+    useAppStore.getState().setEditingPartId(null);
+  }, []);
 
   const onField = (key: SheetNumberKey) => (event: ChangeEvent<HTMLInputElement>) => {
     const value = Number(event.target.value);
@@ -89,6 +106,33 @@ export function LayoutPanel(): JSX.Element {
     } finally {
       setBusy(false);
     }
+  };
+
+  /** 作图参数里的数值输入：非数字回落为 0，交给后端报错 */
+  const onShapeNumber = (key: 'width' | 'height' | 'diameter') =>
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const value = Number(event.target.value);
+      setShapeSize((prev) => ({ ...prev, [key]: Number.isFinite(value) ? Math.max(0, value) : 0 }));
+    };
+
+  /** 参数新建（矩形/圆）：多边形走画布绘制，不走这里 */
+  const onCreateShape = () => {
+    if (shapeKind === 'circle') {
+      void addShape({ kind: 'circle', diameter: shapeSize.diameter, name: shapeName });
+      return;
+    }
+    void addShape({
+      kind: 'rect', width: shapeSize.width, height: shapeSize.height, name: shapeName,
+    });
+  };
+
+  /** 顶点编辑开关：只允许对“选中的单个零件”进入 */
+  const onToggleEdit = () => {
+    if (editingPartId !== null) {
+      setEditingPartId(null);
+      return;
+    }
+    if (selected.length === 1) setEditingPartId(selected[0].id);
   };
 
   return (
@@ -238,6 +282,94 @@ export function LayoutPanel(): JSX.Element {
         </div>
       </div>
 
+      <div className="panel-title">作图</div>
+      <div className="form">
+        <label className="form-row">
+          <span>形状</span>
+          <select
+            value={shapeKind}
+            onChange={(event) => {
+              const next = event.target.value as ShapeKind;
+              setShapeKind(next);
+              // 切走时把绘制状态收掉，避免“选了矩形但画布还在画多边形”
+              if (next !== 'polygon') setDrawingShape(false);
+            }}
+            disabled={busy}
+          >
+            <option value="rect">矩形</option>
+            <option value="circle">圆</option>
+            <option value="polygon">多边形（画布绘制）</option>
+          </select>
+        </label>
+
+        {shapeKind === 'rect' && (
+          <>
+            <label className="form-row">
+              <span>宽 (mm)</span>
+              <input type="number" min={1} step={10} value={shapeSize.width}
+                onChange={onShapeNumber('width')} disabled={busy} />
+            </label>
+            <label className="form-row">
+              <span>高 (mm)</span>
+              <input type="number" min={1} step={10} value={shapeSize.height}
+                onChange={onShapeNumber('height')} disabled={busy} />
+            </label>
+          </>
+        )}
+
+        {shapeKind === 'circle' && (
+          <label className="form-row">
+            <span>直径 (mm)</span>
+            <input type="number" min={1} step={10} value={shapeSize.diameter}
+              onChange={onShapeNumber('diameter')} disabled={busy} />
+          </label>
+        )}
+
+        <label className="form-row">
+          <span>名称</span>
+          <input
+            value={shapeName}
+            onChange={(event) => setShapeName(event.target.value)}
+            placeholder="留空自动命名"
+            maxLength={64}
+            disabled={busy}
+          />
+        </label>
+
+        <div className="form-actions">
+          {shapeKind === 'polygon' ? (
+            <button
+              type="button"
+              className="btn btn-accent"
+              onClick={() => setDrawingShape(!drawingShape)}
+              title="在画布上依次点顶点，双击或回车闭合；Esc 取消"
+            >
+              {drawingShape ? '取消绘制' : '在画布上绘制'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-accent"
+              onClick={onCreateShape}
+              disabled={busy || layout === null}
+              title="按尺寸新建一个零件，直接排到板上；整板放不下会停靠在板外上方"
+            >
+              新建零件
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn"
+            onClick={onToggleEdit}
+            disabled={busy || (editingPartId === null
+              && (selected.length !== 1 || selected[0].locked))}
+            title="选中单个零件后进入顶点编辑：拖绿色方块改造型，Esc 退出"
+          >
+            {editingPartId === null ? '改造型' : '退出改造型'}
+          </button>
+        </div>
+      </div>
+
       <div className="panel-title">自动排料</div>
       <div className="form">
         <label className="form-row">
@@ -315,8 +447,9 @@ export function LayoutPanel(): JSX.Element {
       <div className="panel-footer">
         点零件任意位置即可拖动，R / Shift+R 旋转，L 锁定；锁定后不可移动。
         “复制零件”按选中零件的轮廓再生成 N 个同款件，放不下的停靠在板外上方，拖进来即可。
+        “作图”可直接新建矩形/圆，或切到多边形在画布上依次点顶点、双击闭合；
+        “改造型”选中单个零件后拖绿色方块改形状，松手由后端校验越界与间距。
         自动排料只重排未锁定零件，木纹锁定件不旋转，排料中可随时取消。
-        松手即由后端校验越界与最小间距，不通过自动回弹。
       </div>
     </aside>
   );

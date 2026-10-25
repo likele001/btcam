@@ -27,8 +27,10 @@ from app.models.schemas import (
     LayoutFixedRotRequest,
     LayoutLockRequest,
     LayoutNestRequest,
+    LayoutOutlineRequest,
     LayoutPlaceRequest,
     LayoutRotateRequest,
+    LayoutShapeRequest,
     LayoutSheetRequest,
     TaskAccepted,
 )
@@ -164,6 +166,37 @@ async def layout_duplicate(req: LayoutDuplicateRequest) -> Dict[str, Any]:
             return layout_service.duplicate(conn, pid, req.partId, req.count)
 
     result = await run_in_threadpool(_copy)
+    meta = await _publish(result.state)
+    return _respond(result, meta)
+
+
+@router.post("/add-shape")
+async def layout_add_shape(req: LayoutShapeRequest) -> Dict[str, Any]:
+    """新建零件（排料板作图）：矩形 / 圆 / 手绘多边形，直接当可排件。"""
+    pid = _project_id(req.projectId)
+
+    def _create() -> LayoutResult:
+        with db.get_conn() as conn:
+            return layout_service.add_shape(
+                conn, pid, kind=req.kind, name=req.name, width=req.width,
+                height=req.height, diameter=req.diameter, points=req.points,
+                at=req.at)
+
+    result = await run_in_threadpool(_create)
+    meta = await _publish(result.state)
+    return _respond(result, meta)
+
+
+@router.post("/update-outline")
+async def layout_update_outline(req: LayoutOutlineRequest) -> Dict[str, Any]:
+    """改造型（顶点编辑）：用拖过顶点的轮廓替换零件几何，位置随之重算。"""
+    pid = _project_id(req.projectId)
+
+    def _update() -> LayoutResult:
+        with db.get_conn() as conn:
+            return layout_service.update_outline(conn, pid, req.partId, req.contours)
+
+    result = await run_in_threadpool(_update)
     meta = await _publish(result.state)
     return _respond(result, meta)
 

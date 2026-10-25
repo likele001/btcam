@@ -76,6 +76,10 @@ interface AppState {
   startPoints: ToolpathStartPoint[];
   /** 是否处于“点选起割点”模式（画布光标的十字准线） */
   pickingStart: boolean;
+  /** 作图环节：画布手绘多边形中（面板按钮据此变成“取消绘制”） */
+  drawingShape: boolean;
+  /** 顶点编辑中的零件 id；null = 不在编辑 */
+  editingPartId: number | null;
   /** 最近一次刀路结果明细（轮廓/桥/吸附后的起割点/统计） */
   toolpathPreview: ToolpathPreviewMeta | null;
   /** 刀具库 / 工艺模板（模块 6）：全局缓存，面板与弹窗共用 */
@@ -135,6 +139,8 @@ interface AppState {
   removeStartPoint: (index: number) => void;
   clearStartPoints: () => void;
   setPickingStart: (picking: boolean) => void;
+  setDrawingShape: (drawing: boolean) => void;
+  setEditingPartId: (partId: number | null) => void;
   setTools: (tools: ToolRecord[]) => void;
   setTemplates: (templates: TemplateRecord[]) => void;
   setToolLibraryOpen: (open: boolean) => void;
@@ -388,6 +394,8 @@ export const useAppStore = create<AppState>((set) => ({
   toolpathRequest: null,
   startPoints: [],
   pickingStart: false,
+  drawingShape: false,
+  editingPartId: null,
   toolpathPreview: null,
   tools: [],
   templates: [],
@@ -578,6 +586,10 @@ export const useAppStore = create<AppState>((set) => ({
   clearStartPoints: () => set({ startPoints: [] }),
 
   setPickingStart: (pickingStart) => set({ pickingStart }),
+
+  setDrawingShape: (drawingShape) => set({ drawingShape }),
+
+  setEditingPartId: (editingPartId) => set({ editingPartId }),
 
   setTools: (tools) => set({ tools }),
 

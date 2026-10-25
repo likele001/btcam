@@ -11,7 +11,8 @@
 
 import { useCallback } from 'react';
 
-import { api, type LayoutActionResult, type LayoutNestParams, type SheetParams } from '@/net/rest';
+import { api, type LayoutActionResult, type LayoutNestParams, type LayoutShapeParams,
+  type SheetParams } from '@/net/rest';
 import { requestLayoutSync } from '@/net/session';
 import { selectedLayoutParts, useAppStore } from '@/state/app-store';
 import type { LayoutPartInfo } from '@/types/geometry';
@@ -28,6 +29,10 @@ export interface LayoutActions {
   movePart: (partId: number, tx: number, ty: number) => Promise<void>;
   /** 选中零件各复制若干份（排料板增件） */
   duplicateSelected: (count: number) => Promise<void>;
+  /** 新建零件（作图）：矩形/圆/多边形，直接当可排件 */
+  addShape: (params: Omit<LayoutShapeParams, 'projectId'>) => Promise<void>;
+  /** 改造型：提交顶点编辑后的轮廓（世界坐标点串） */
+  updateOutline: (partId: number, contours: Array<Array<[number, number]>>) => Promise<void>;
   /** 选中零件整体旋转（±角度） */
   rotateSelected: (delta: number) => Promise<void>;
   /** 选中零件整体锁定/解锁 */
@@ -145,6 +150,36 @@ export function useLayoutActions(onReject?: () => void): LayoutActions {
     }
   }, []);
 
+  /**
+   * 新建零件（作图）：后端负责生成轮廓、找空位、写库。
+   * 消息里带上实际尺寸与“是否停靠”，用户能立刻判断要不要再拖一下。
+   */
+  const addShape = useCallback(async (params: Omit<LayoutShapeParams, 'projectId'>) => {
+    const store = useAppStore.getState();
+    try {
+      const result = await api.layout.addShape({ ...params, projectId: projectId() });
+      if (!result.ok) {
+        store.setMessage(`新建零件失败：${result.reason}`);
+        return;
+      }
+      store.setMessage(result.parked
+        ? `已新建 ${result.width}×${result.height} 零件，板上放不下，已停靠在板外上方`
+        : `已新建零件 ${result.width}×${result.height}`);
+    } catch (error) {
+      store.setMessage(`新建零件失败：${(error as Error).message}`);
+    } finally {
+      requestLayoutSync();
+    }
+  }, []);
+
+  const updateOutline = useCallback(
+    (partId: number, contours: Array<Array<[number, number]>>) => run(
+      () => api.layout.updateOutline({ projectId: projectId(), partId, contours }),
+      '造型已更新',
+    ),
+    [run],
+  );
+
   const rotateSelected = useCallback(
     (delta: number) => eachSelected('旋转', (part) =>
       api.layout.rotate({ projectId: projectId(), partId: part.id, rot: part.rot + delta })),
@@ -217,7 +252,7 @@ export function useLayoutActions(onReject?: () => void): LayoutActions {
   }, []);
 
   return {
-    open, applySheet, movePart, duplicateSelected, rotateSelected, lockSelected, fixedRotSelected,
-    nest, cancelNest, reset,
+    open, applySheet, movePart, duplicateSelected, addShape, updateOutline,
+    rotateSelected, lockSelected, fixedRotSelected, nest, cancelNest, reset,
   };
 }

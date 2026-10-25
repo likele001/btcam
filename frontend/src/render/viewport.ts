@@ -10,6 +10,7 @@
  *   - L 键          : 排料模式下锁定/解锁选中零件
  *   - F 键          : 缩放到全部图形
  *   - Esc           : 取消当前操作
+ *   - 作图模式      : 左键依次点顶点，双击/回车闭合；顶点编辑时拖动手柄改造型
  *
  * 职责边界：排料拖拽只做“像素级平移”用于实时反馈，
  * 落库与越界/重叠判定全部交后端（松手后发一次请求）。
@@ -46,6 +47,10 @@ export interface CanvasCallbacks {
   onLockToggle?: () => void;
   /** 点选起割点模式被 Esc 取消（面板据此同步按钮状态） */
   onPointPickEnd?: () => void;
+  /** 手绘多边形结束（完成或取消），面板据此复位“绘制中”状态 */
+  onDrawEnd?: () => void;
+  /** 顶点编辑模式结束，面板据此复位按钮状态 */
+  onVertexEditEnd?: () => void;
 }
 
 const BG_COLOR = 0x14161a;
@@ -56,6 +61,12 @@ const BOX_COLOR = 0x4fa3ff;
 const PICK_TOLERANCE_PX = 6;
 /** 小于该拖动距离视为点击而非框选 */
 const CLICK_THRESHOLD_PX = 3;
+/** 手绘多边形与顶点手柄的配色（与作图图层同色系） */
+const DRAW_COLOR = 0xffb020;
+const HANDLE_COLOR = 0x3ddc97;
+/** 顶点手柄的屏幕尺寸：半边长 / 命中容差 */
+const HANDLE_SIZE_PX = 4;
+const HANDLE_HIT_PX = 9;
 
 export class CanvasController {
   readonly camera = new Camera();
@@ -89,11 +100,24 @@ export class CanvasController {
   private dragOffset = { dx: 0, dy: 0 };
   private dragStartWorld = { x: 0, y: 0 };
 
-  private mode: 'idle' | 'pan' | 'box' | 'drag-part' = 'idle';
+  private mode: 'idle' | 'pan' | 'box' | 'drag-part' | 'draw-poly' | 'drag-vertex' = 'idle';
   private additive = false;
   private spaceDown = false;
   private dragStart = { x: 0, y: 0 };
   private dragCurrent = { x: 0, y: 0 };
+
+  // --- 作图（新建多边形 / 顶点编辑）
+  /** 手绘中已点的顶点（世界坐标）与当前光标，光标只用于橡皮筋预览 */
+  private drawPoints: Point2[] = [];
+  private drawCursor: Point2 | null = null;
+  private drawDone: ((points: Point2[]) => void) | null = null;
+  /** 顶点编辑：draft 是零件的全部轮廓（世界坐标），拖动只改 draft */
+  private vertexEdit: {
+    partId: number;
+    contours: Array<{ isHole: boolean; pts: Point2[] }>;
+    drag: { contour: number; index: number } | null;
+  } | null = null;
+  private vertexCommit: ((partId: number, contours: Point2[][]) => void) | null = null;
 
   private rafId = 0;
   private resizeObserver: ResizeObserver | null = null;
@@ -184,6 +208,8 @@ export class CanvasController {
     this.dragPartId = null;
     this.dragOffset = { dx: 0, dy: 0 };
     this.rebuildPartIndex();
+    // 顶点编辑中的手柄也要跟着新几何走（后端拒绝时即回弹）
+    this.rebuildVertexDraft();
     this.requestRender();
   }
 
@@ -249,6 +275,98 @@ export class CanvasController {
   setPickPoints(points: Array<{ x: number; y: number }>): void {
     this.pickPoints = points;
     this.requestRender();
+  }
+
+  // ------------------------------------------------------------ 作图模式
+  /**
+   * 进入手绘多边形：左键依次点顶点，双击或回车闭合，Esc 取消。
+   *
+   * 这里只采集世界坐标点串，是否合法、摆在哪儿全交后端 ——
+   * 与框选/拖拽一样，几何结论只有后端一处。
+   */
+  beginPolygonDraw(onDone: (points: Point2[]) => void): void {
+    this.drawPoints = [];
+    this.drawCursor = null;
+    this.drawDone = onDone;
+    this.mode = 'idle';
+    if (this.canvas) this.canvas.style.cursor = 'crosshair';
+    this.requestRender();
+  }
+
+  /** 退出手绘模式（重复调用安全）；会通知外层复位按钮状态 */
+  endPolygonDraw(): void {
+    if (this.drawDone === null) return;
+    this.drawDone = null;
+    this.drawPoints = [];
+    this.drawCursor = null;
+    if (this.canvas && this.mode !== 'pan') this.canvas.style.cursor = 'default';
+    this.callbacks.onDrawEnd?.();
+    this.requestRender();
+  }
+
+  /** 手绘闭合：点不够 3 个就当取消，避免发一个必然被后端拒的请求 */
+  private finishPolygonDraw(): void {
+    const points = this.drawPoints.slice();
+    const done = this.drawDone;
+    this.endPolygonDraw();
+    if (done && points.length >= 3) done(points);
+  }
+
+  /**
+   * 进入顶点编辑：把零件现有轮廓的每个顶点做成可拖手柄。
+   *
+   * draft 存世界坐标（就是屏幕上看到的坐标），松手整串交给后端 ——
+   * 后端按"新包围盒左下角"重新落位，所以拖到哪切出来就是哪。
+   */
+  beginVertexEdit(partId: number,
+                  onCommit: (partId: number, contours: Point2[][]) => void): void {
+    this.vertexCommit = onCommit;
+    this.vertexEdit = { partId, contours: [], drag: null };
+    this.rebuildVertexDraft();
+    if (this.canvas) this.canvas.style.cursor = 'default';
+    this.requestRender();
+  }
+
+  /** 退出顶点编辑（重复调用安全） */
+  endVertexEdit(): void {
+    if (this.vertexEdit === null) return;
+    this.vertexEdit = null;
+    this.vertexCommit = null;
+    if (this.mode === 'drag-vertex') this.mode = 'idle';
+    if (this.canvas && this.mode !== 'pan') this.canvas.style.cursor = 'default';
+    this.callbacks.onVertexEditEnd?.();
+    this.requestRender();
+  }
+
+  /** 用最新的排料帧重建手柄：后端拒绝拖拽时，这一步就是“回弹” */
+  private rebuildVertexDraft(): void {
+    const edit = this.vertexEdit;
+    if (!edit) return;
+    const shapes = this.partShapes.get(edit.partId);
+    if (!shapes || shapes.length === 0) {
+      this.endVertexEdit();
+      return;
+    }
+    edit.contours = shapes.map((poly) => ({
+      isHole: poly.isHole === true,
+      pts: pointsOf(poly),
+    }));
+    edit.drag = null;
+  }
+
+  /** 顶点手柄命中（屏幕距离）：返回轮廓下标与顶点下标 */
+  private vertexHandleAt(sx: number, sy: number): { contour: number; index: number } | null {
+    const edit = this.vertexEdit;
+    if (!edit || !this.app) return null;
+    const { width, height } = this.app.screen;
+    for (let ci = 0; ci < edit.contours.length; ci += 1) {
+      const pts = edit.contours[ci].pts;
+      for (let index = 0; index < pts.length; index += 1) {
+        const s = this.camera.worldToScreen(pts[index].x, pts[index].y, width, height);
+        if (Math.hypot(s.x - sx, s.y - sy) <= HANDLE_HIT_PX) return { contour: ci, index };
+      }
+    }
+    return null;
   }
 
   /** 缩放到全部图形；排料/预览模式下把板材边界也纳入，否则板边看不见 */
@@ -400,6 +518,55 @@ export class CanvasController {
           .stroke({ width: 1, color: BOX_COLOR, alpha: 0.9 });
       }
     }
+
+    this.drawShapeOverlay(g, width, height);
+  }
+
+  /** 手绘预览与顶点手柄：全部用屏幕坐标画，线宽/块大小不随缩放变 */
+  private drawShapeOverlay(g: Graphics, width: number, height: number): void {
+    // --- 手绘多边形：已点折线 + 到光标的橡皮筋 + 闭合提示 ---
+    if (this.drawDone && this.drawPoints.length > 0) {
+      const screen = this.drawPoints.map(
+        (p) => this.camera.worldToScreen(p.x, p.y, width, height));
+      g.moveTo(screen[0].x, screen[0].y);
+      for (let i = 1; i < screen.length; i += 1) g.lineTo(screen[i].x, screen[i].y);
+      g.stroke({ width: 1.5, color: DRAW_COLOR, alpha: 0.95 });
+
+      if (this.drawCursor) {
+        const last = screen[screen.length - 1];
+        const cursor = this.camera.worldToScreen(this.drawCursor.x, this.drawCursor.y, width, height);
+        g.moveTo(last.x, last.y).lineTo(cursor.x, cursor.y)
+          .stroke({ width: 1, color: DRAW_COLOR, alpha: 0.55 });
+        if (screen.length >= 2) {
+          g.moveTo(cursor.x, cursor.y).lineTo(screen[0].x, screen[0].y)
+            .stroke({ width: 1, color: DRAW_COLOR, alpha: 0.3 });
+        }
+      }
+      for (const s of screen) {
+        g.rect(s.x - 3, s.y - 3, 6, 6);
+      }
+      g.fill({ color: DRAW_COLOR, alpha: 0.95 });
+    }
+
+    // --- 顶点编辑手柄：轮廓描绿线 + 每个顶点一个小方块 ---
+    const edit = this.vertexEdit;
+    if (edit) {
+      for (const contour of edit.contours) {
+        const screen = contour.pts.map(
+          (p) => this.camera.worldToScreen(p.x, p.y, width, height));
+        if (screen.length > 1) {
+          g.moveTo(screen[0].x, screen[0].y);
+          for (let i = 1; i < screen.length; i += 1) g.lineTo(screen[i].x, screen[i].y);
+          g.closePath();
+          g.stroke({ width: 1.2, color: HANDLE_COLOR, alpha: 0.75 });
+        }
+        for (const s of screen) {
+          g.rect(s.x - HANDLE_SIZE_PX, s.y - HANDLE_SIZE_PX,
+            HANDLE_SIZE_PX * 2, HANDLE_SIZE_PX * 2);
+        }
+        g.fill({ color: HANDLE_COLOR, alpha: 0.95 });
+      }
+    }
   }
 
   /** 待提交的起割点：屏幕固定大小的菱形，缩放时不会看不见 */
@@ -458,6 +625,31 @@ export class CanvasController {
     if (wantPan) {
       this.mode = 'pan';
       this.canvas.style.cursor = 'grabbing';
+    } else if (event.button === 0 && this.drawDone) {
+      // 手绘多边形：单击加点；双击（detail>=2）闭合，第二次点击不再重复加点
+      const world = this.camera.screenToWorld(point.x, point.y,
+        this.app.screen.width, this.app.screen.height);
+      if (event.detail >= 2) {
+        this.finishPolygonDraw();
+      } else {
+        this.drawPoints.push({ x: world.x, y: world.y });
+        this.drawCursor = { x: world.x, y: world.y };
+        this.requestRender();
+      }
+      event.preventDefault();
+      return;
+    } else if (event.button === 0 && this.vertexEdit) {
+      // 顶点编辑：只有命中手柄才拖动；点空白既不框选也不拖零件
+      const hit = this.vertexHandleAt(point.x, point.y);
+      if (hit) {
+        this.vertexEdit.drag = hit;
+        this.mode = 'drag-vertex';
+        this.canvas.style.cursor = 'grabbing';
+        this.canvas.setPointerCapture(event.pointerId);
+      }
+      event.preventDefault();
+      this.requestRender();
+      return;
     } else if (event.button === 0 && this.pointPick) {
       // 点选起割点：只回传世界坐标，不动选择集，也不进入框选
       const world = this.camera.screenToWorld(point.x, point.y,
@@ -567,12 +759,29 @@ export class CanvasController {
     const world = this.camera.screenToWorld(point.x, point.y,
       this.app.screen.width, this.app.screen.height);
 
+    // 手绘中：光标就是橡皮筋终点
+    if (this.drawDone) {
+      this.drawCursor = { x: world.x, y: world.y };
+      this.requestRender();
+    }
+
     if (this.mode === 'pan') {
       this.camera.panBy(point.x - this.dragCurrent.x, point.y - this.dragCurrent.y);
       this.dragCurrent = point;
       this.requestRender();
     } else if (this.mode === 'box') {
       this.dragCurrent = point;
+      this.requestRender();
+    } else if (this.mode === 'drag-vertex') {
+      // 只改 draft 的那个顶点，松手才提交
+      const edit = this.vertexEdit;
+      if (edit?.drag) {
+        const target = edit.contours[edit.drag.contour]?.pts[edit.drag.index];
+        if (target) {
+          target.x = world.x;
+          target.y = world.y;
+        }
+      }
       this.requestRender();
     } else if (this.mode === 'drag-part') {
       // 只做像素级位移反馈，几何合法性交给后端
@@ -608,6 +817,15 @@ export class CanvasController {
         this.dragPartId = null;
         this.dragOffset = { dx: 0, dy: 0 };
       }
+    } else if (this.mode === 'drag-vertex') {
+      const edit = this.vertexEdit;
+      const commit = this.vertexCommit;
+      if (edit?.drag && commit) {
+        // 整串轮廓（外轮廓 + 内孔）一起提交，后端按新包围盒重新落位
+        commit(edit.partId, edit.contours.map((item) => item.pts.map((p) => ({ ...p }))));
+      }
+      if (edit) edit.drag = null;
+      if (this.canvas) this.canvas.style.cursor = 'default';
     } else if (this.mode === 'box') {
       const moved = Math.hypot(point.x - this.dragStart.x, point.y - this.dragStart.y);
       if (moved < CLICK_THRESHOLD_PX) {
@@ -635,7 +853,7 @@ export class CanvasController {
     }
 
     this.mode = 'idle';
-    this.canvas.style.cursor = this.pointPick
+    this.canvas.style.cursor = (this.drawDone || this.pointPick)
       ? 'crosshair'
       : (this.spaceDown ? 'grab' : 'default');
     if (this.canvas.hasPointerCapture(event.pointerId)) {
@@ -669,6 +887,10 @@ export class CanvasController {
       this.spaceDown = true;
       if (this.canvas) this.canvas.style.cursor = 'grab';
       event.preventDefault();
+    } else if (this.drawDone && event.key === 'Enter') {
+      // 手绘中回车闭合（双击之外的另一个习惯路径）
+      this.finishPolygonDraw();
+      event.preventDefault();
     } else if (event.key === 'f' || event.key === 'F') {
       this.fitToContent();
     } else if (this.layout && (event.key === 'r' || event.key === 'R')) {
@@ -681,7 +903,12 @@ export class CanvasController {
     } else if (event.key === 'Escape') {
       this.mode = 'idle';
       this.cancelDrag();
-      if (this.pointPick) {
+      // 作图/顶点编辑优先退出，避免一次 Esc 同时退掉好几层状态
+      if (this.drawDone) {
+        this.endPolygonDraw();
+      } else if (this.vertexEdit) {
+        this.endVertexEdit();
+      } else if (this.pointPick) {
         this.endPointPick();
         this.callbacks.onPointPickEnd?.();
       }
@@ -738,4 +965,13 @@ export class CanvasController {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
   }
+}
+
+/** 紧凑点串 [x0,y0,x1,y1,...] -> 点对象数组（作图/顶点编辑用） */
+function pointsOf(poly: Polyline): Point2[] {
+  const pts = poly.pts;
+  const count = Math.floor(pts.length / 2);
+  const out: Point2[] = [];
+  for (let i = 0; i < count; i += 1) out.push({ x: pts[i * 2], y: pts[i * 2 + 1] });
+  return out;
 }
