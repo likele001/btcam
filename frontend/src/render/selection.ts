@@ -169,6 +169,33 @@ export function pickAt(polylines: Polyline[], point: Point2, tolerance: number):
   return bestId;
 }
 
+/**
+ * 点是否落在轮廓围成的区域里（射线法 + 奇偶规则）。
+ *
+ * 一个零件通常是「外轮廓 + 若干内孔」，奇偶规则天然把孔洞判成外，
+ * 不需要先分辨哪条是外轮廓 —— 排料模式下“点零件任意位置就能拖”靠它。
+ */
+export function pointInPolylines(polylines: Polyline[], point: Point2): boolean {
+  let inside = false;
+  for (const poly of polylines) {
+    const pts = poly.pts;
+    const count = pts.length / 2;
+    if (count < 3) continue;
+    for (let i = 0, j = count - 1; i < count; j = i, i += 1) {
+      const xi = pts[i * 2];
+      const yi = pts[i * 2 + 1];
+      const xj = pts[j * 2];
+      const yj = pts[j * 2 + 1];
+      // 只统计射线在 y 方向上穿过的边，避免水平边与顶点重复计数
+      if ((yi > point.y) !== (yj > point.y)) {
+        const crossX = ((xj - xi) * (point.y - yi)) / (yj - yi) + xi;
+        if (point.x < crossX) inside = !inside;
+      }
+    }
+  }
+  return inside;
+}
+
 /** 合并多个轮廓的包围盒 */
 export function unionBBox(polylines: Polyline[]): BBox | null {
   if (polylines.length === 0) return null;

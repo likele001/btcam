@@ -260,6 +260,14 @@ class LayoutFixedRotRequest(BaseModel):
     fixedRot: bool = True
 
 
+class LayoutDuplicateRequest(BaseModel):
+    """复制零件（排料板增件）：份数上限防误输入一次造出上千个零件拖垮渲染。"""
+
+    projectId: Optional[int] = None
+    partId: int
+    count: int = Field(1, ge=1, le=99, description="复制份数（1~99）")
+
+
 class LayoutNestRequest(BaseModel):
     """自动排料（模块 4）：在排料板上重排零件。
 

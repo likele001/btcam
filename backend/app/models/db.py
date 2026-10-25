@@ -603,6 +603,29 @@ def load_polylines(conn: sqlite3.Connection, project_id: int) -> List[Dict[str, 
     return out
 
 
+def load_part_polylines(conn: sqlite3.Connection, project_id: int,
+                        part_id: int) -> List[Dict[str, Any]]:
+    """只读一个零件的轮廓（复制零件时用，不必把整张图纸都取出来）。"""
+    cur = conn.execute(
+        "SELECT id, part_id, layer_id, closed, is_hole, point_count, bbox, pts FROM polyline"
+        " WHERE project_id = ? AND part_id = ? ORDER BY id",
+        (project_id, part_id),
+    )
+    out: List[Dict[str, Any]] = []
+    for row in cur:
+        arr = np.frombuffer(row["pts"], dtype="<f4").reshape(-1, 2)
+        out.append({
+            "id": row["id"],
+            "part_id": row["part_id"],
+            "layer_id": row["layer_id"],
+            "closed": bool(row["closed"]),
+            "is_hole": bool(row["is_hole"]),
+            "bbox": json.loads(row["bbox"]),
+            "pts": arr,
+        })
+    return out
+
+
 # ---------------------------------------------------------------- 零件与导入
 def clear_document(conn: sqlite3.Connection, project_id: int) -> None:
     """清空当前工程的轮廓与零件（重新导入时调用，图层保留）。

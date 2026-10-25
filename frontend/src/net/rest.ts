@@ -495,6 +495,13 @@ export interface LayoutActionResult {
   placements?: LayoutPlacement[];
 }
 
+/** 复制零件的结果：copied 实际新增件数，parked 其中放不下停靠到板外上方的件数 */
+export interface LayoutDuplicateResult extends LayoutActionResult {
+  copied: number;
+  parked: number;
+  partIds: number[];
+}
+
 export interface SheetParams {
   projectId?: number;
   width: number;
@@ -937,6 +944,13 @@ export const api = {
 
     place: (payload: { projectId?: number; partId: number; tx: number; ty: number }) =>
       request<LayoutActionResult>('/api/layout/place', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+
+    /** 复制零件（排料板增件）：只传 partId 则加 1 件 */
+    duplicate: (payload: { projectId?: number; partId: number; count?: number }) =>
+      request<LayoutDuplicateResult>('/api/layout/duplicate', {
         method: 'POST',
         body: JSON.stringify(payload),
       }),

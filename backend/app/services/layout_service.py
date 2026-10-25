@@ -42,6 +42,8 @@ EPS = 1e-6
 MIN_OVERLAP_AREA = 1e-3
 # 停靠件与板材上边界的距离（mm）：留一条缝，前端画出来不会和板框粘在一起
 PARK_OFFSET = 10.0
+# 复制零件时沿原件右侧/下方外推的候选步数（再多就交给停靠区，避免拖慢响应）
+COPY_SCAN_STEPS = 8
 
 
 # ---------------------------------------------------------------- 数据结构
@@ -152,6 +154,8 @@ class LayoutResult:
     ok: bool
     reason: str
     state: LayoutState
+    # 额外的响应字段（如复制件数/停靠件数），只回给发起方，不进 WS 广播
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- 服务类
@@ -408,6 +412,129 @@ class LayoutService:
                           placement.locked, placement.zorder,
                           fixed_rot=placement.fixed_rot)
         return LayoutResult(True, "", state)
+
+    # ------------------------------------------------------------ 复制增件
+    @staticmethod
+    def _copy_name(state: LayoutState, name: str) -> str:
+        """复制件命名：去掉已有的 " (n)" 后缀，再取同级序号 +1。"""
+        base = name
+        if base.endswith(")") and " (" in base:
+            head, _, tail = base.rpartition(" (")
+            if tail[:-1].isdigit():
+                base = head
+        used = 1
+        for part in state.parts:
+            other = part.name
+            if other.startswith(base + " (") and other.endswith(")"):
+                suffix = other[len(base) + 2:-1]
+                if suffix.isdigit():
+                    used = max(used, int(suffix))
+        return f"{base} ({used + 1})"
+
+    def duplicate(self, conn: Any, project_id: int, part_id: int,
+                  count: int = 1) -> LayoutResult:
+        """复制零件 count 份（模块 3 手动增件）：几何、角度、木纹锁定一并继承。
+
+        摆放策略：先贴着原件右侧/上方、再贴着已有零件找空位；整块板都放不下时
+        停靠到板外上方 —— 不静默叠在原件上，用户能一眼看见也能直接拖进来。
+        """
+        state = self.load(conn, project_id)
+        source = state.part(part_id)
+        placement = state.placements.get(part_id)
+        if source is None or placement is None:
+            return LayoutResult(False, f"零件 #{part_id} 不在排料板上", state)
+
+        rows = db.load_part_polylines(conn, project_id, part_id)
+        if not rows:
+            return LayoutResult(False, f"零件「{source.name}」没有轮廓，无法复制", state)
+
+        total = max(1, int(count))
+        zorder = max((item.zorder for item in state.placements.values()), default=-1) + 1
+        created: List[int] = []
+        parked = 0
+        for index in range(total):
+            name = self._copy_name(state, source.name)
+            bbox = [0.0, 0.0, round(source.width, 3), round(source.height, 3)]
+            new_id = db.create_part(conn, project_id, name, "copy", bbox)
+            db.save_part_polylines(conn, project_id, new_id, [
+                (int(row["layer_id"]), bool(row["closed"]), bool(row["is_hole"]), row["pts"])
+                for row in rows
+            ])
+
+            # 几何与原件同源：轮廓已归一化到包围盒左下角，直接复用即可
+            part = LayoutPart(id=new_id, name=name, contours=source.contours,
+                              width=source.width, height=source.height,
+                              outline=source.outline, outline_index=source.outline_index,
+                              area=source.area)
+            state.parts.append(part)
+
+            rot = placement.rot
+            spot = self._free_spot(state, part, rot, placement, source)
+            if spot is None:
+                tx, ty = self._park_spot(state, part, rot)
+                parked += 1
+            else:
+                tx, ty = spot
+            state.placements[new_id] = Placement(
+                part_id=new_id, sheet=0, tx=tx, ty=ty, rot=rot,
+                locked=False, zorder=zorder + index, fixed_rot=placement.fixed_rot)
+            db.save_placement(conn, project_id, new_id, 0, tx, ty, rot,
+                              locked=False, zorder=zorder + index,
+                              fixed_rot=placement.fixed_rot)
+            created.append(new_id)
+
+        logger.info("复制零件「%s」%d 份（停靠 %d 份）", source.name, total, parked)
+        return LayoutResult(True, "", state,
+                            extra={"copied": len(created), "parked": parked,
+                                   "partIds": created})
+
+    def _free_spot(self, state: LayoutState, part: LayoutPart, rot: float,
+                   anchor: Placement, anchor_part: LayoutPart,
+                   ) -> Optional[Tuple[float, float]]:
+        """在已排零件边缘找第一个合法位置；整张板都放不下时返回 None。"""
+        margin = float(state.sheet["margin"])
+        gap = float(state.sheet["gap"])
+        anchor_w, anchor_h = anchor_part.size_at(anchor.rot)
+
+        candidates: List[Tuple[float, float]] = []
+        # 先沿原件右侧外推，再沿下方外推：最贴近"再加一件同款"的直觉
+        for step in range(1, COPY_SCAN_STEPS + 1):
+            candidates.append((anchor.tx + (anchor_w + gap) * step, anchor.ty))
+            candidates.append((anchor.tx, anchor.ty - (anchor_h + gap) * step))
+        # 再贴着每个已排零件的右侧与上方试
+        for other in state.parts:
+            place = state.placements.get(other.id)
+            if place is None or other.id == part.id:
+                continue
+            other_w, other_h = other.size_at(place.rot)
+            candidates.append((place.tx + other_w + gap, place.ty))
+            candidates.append((place.tx, place.ty + other_h + gap))
+        candidates.append((margin, margin))
+
+        for tx, ty in candidates:
+            if not self._check(state, part, rot, tx, ty, exclude=part.id):
+                return round(tx, 3), round(ty, 3)
+        return None
+
+    def _park_spot(self, state: LayoutState, part: LayoutPart,
+                   rot: float) -> Tuple[float, float]:
+        """板外上方停靠位：接在已有停靠件右侧，超出板宽就另起一行。"""
+        sheet_w = float(state.sheet["width"])
+        gap = float(state.sheet["gap"])
+        width, height = part.size_at(rot)
+        base_y = float(state.sheet["height"]) + PARK_OFFSET
+        row_y, next_x, row_h = base_y, 0.0, 0.0
+        for other in state.parts:
+            place = state.placements.get(other.id)
+            if place is None or place.ty < base_y - EPS:
+                continue
+            other_w, other_h = other.size_at(place.rot)
+            row_y = max(row_y, place.ty)
+            next_x = max(next_x, place.tx + other_w + gap)
+            row_h = max(row_h, other_h)
+        if next_x > 0 and next_x + width > max(sheet_w, width):
+            return 0.0, round(row_y + row_h + gap, 3)
+        return round(next_x, 3), round(row_y, 3)
 
     def reset(self, conn: Any, project_id: int) -> LayoutResult:
         """清空摆放并重新做一次初始行排。

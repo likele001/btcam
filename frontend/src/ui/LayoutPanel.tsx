@@ -35,7 +35,8 @@ export function LayoutPanel(): JSX.Element {
   const setSelection = useAppStore((s) => s.setSelection);
   const setBusy = useAppStore((s) => s.setBusy);
 
-  const { applySheet, rotateSelected, lockSelected, fixedRotSelected, nest, cancelNest, reset } =
+  const { applySheet, duplicateSelected, rotateSelected, lockSelected, fixedRotSelected, nest,
+    cancelNest, reset } =
     useLayoutActions();
   // 余料（模块 10）：绑定/解绑都走余料接口，轮廓与边界仍由后端提供
   const { open: openScrap, clearSheet } = useScrapActions();
@@ -43,6 +44,8 @@ export function LayoutPanel(): JSX.Element {
   // 自动排料参数：引擎与是否允许 90° 旋转（木纹锁定件始终不转）
   const [engine, setEngine] = useState<LayoutNestParams['engine']>('auto');
   const [rotation, setRotation] = useState(true);
+  // 复制份数：选中零件再生成几件同款（上限与后端 schema 的 1~99 对齐）
+  const [copies, setCopies] = useState(1);
   const nesting = tasks.some((task) => task.kind === 'layout_nest'
     && (task.status === 'queued' || task.status === 'running'));
 
@@ -206,6 +209,35 @@ export function LayoutPanel(): JSX.Element {
         </button>
       </div>
 
+      <div className="form">
+        <label className="form-row">
+          <span>复制份数</span>
+          <input
+            type="number"
+            min={1}
+            max={99}
+            step={1}
+            value={copies}
+            onChange={(event) => {
+              const value = Math.floor(Number(event.target.value));
+              setCopies(Number.isFinite(value) ? Math.min(99, Math.max(1, value)) : 1);
+            }}
+            disabled={busy}
+          />
+        </label>
+        <div className="form-actions">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void duplicateSelected(copies)}
+            disabled={busy || selected.length === 0}
+            title="按选中零件的轮廓再生成 N 个同款件：先贴着原件找空位，放不下的停靠在板外上方"
+          >
+            复制零件
+          </button>
+        </div>
+      </div>
+
       <div className="panel-title">自动排料</div>
       <div className="form">
         <label className="form-row">
@@ -281,7 +313,8 @@ export function LayoutPanel(): JSX.Element {
       </dl>
 
       <div className="panel-footer">
-        拖拽零件摆放，R / Shift+R 旋转，L 锁定；锁定后不可移动。
+        点零件任意位置即可拖动，R / Shift+R 旋转，L 锁定；锁定后不可移动。
+        “复制零件”按选中零件的轮廓再生成 N 个同款件，放不下的停靠在板外上方，拖进来即可。
         自动排料只重排未锁定零件，木纹锁定件不旋转，排料中可随时取消。
         松手即由后端校验越界与最小间距，不通过自动回弹。
       </div>

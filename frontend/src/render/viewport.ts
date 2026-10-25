@@ -4,7 +4,7 @@
  * 交互约定（与主流 CAD/CAM 一致）：
  *   - 滚轮          : 以光标为锚点缩放
  *   - 中键拖动 / 空格+左键拖动 : 平移
- *   - 左键拖动      : 框选（Ctrl/Shift 追加）；排料模式下拖动零件
+ *   - 左键拖动      : 框选（Ctrl/Shift 追加）；排料模式下按住零件内部任意位置拖动
  *   - 左键单击      : 点选轮廓（Ctrl 切换；排料模式下选中整个零件）
  *   - R / Shift+R   : 排料模式下旋转选中零件 ±90°
  *   - L 键          : 排料模式下锁定/解锁选中零件
@@ -28,7 +28,10 @@ import { Application, Container, Graphics } from 'pixi.js';
 import type { BBox, LayerInfo, LayoutPartInfo, LayoutState, Polyline, SheetSpec } from '@/types/geometry';
 import { Camera } from './camera';
 import { GeometryLayer, type DragVisual } from './geometry-layer';
-import { pickAt, rectFromPoints, rectSelect, unionBBox, type WorldRect } from './selection';
+import {
+  pickAt, pointInPolylines, polylineBBox, rectFromPoints, rectSelect, unionBBox,
+  type Point2, type WorldRect,
+} from './selection';
 
 export interface CanvasCallbacks {
   /** 选中集变化（id 列表） */
@@ -79,6 +82,9 @@ export class CanvasController {
   private boardSheet: SheetSpec | null = null;
   private partByPolyline = new Map<number, number>();
   private partById = new Map<number, LayoutPartInfo>();
+  /** 零件 -> 包围盒 / 轮廓：排料模式下面内命中的索引（几何一变就重建） */
+  private partBoxes = new Map<number, BBox>();
+  private partShapes = new Map<number, Polyline[]>();
   private dragPartId: number | null = null;
   private dragOffset = { dx: 0, dy: 0 };
   private dragStartWorld = { x: 0, y: 0 };
@@ -140,6 +146,7 @@ export class CanvasController {
   setGeometry(polylines: Polyline[], layers: LayerInfo[]): void {
     this.polylines = polylines;
     this.layers = new Map(layers.map((layer) => [layer.id, layer]));
+    this.rebuildPartIndex();
     this.requestRender();
   }
 
@@ -176,7 +183,36 @@ export class CanvasController {
     }
     this.dragPartId = null;
     this.dragOffset = { dx: 0, dy: 0 };
+    this.rebuildPartIndex();
     this.requestRender();
+  }
+
+  /**
+   * 重建「零件 -> 包围盒 / 轮廓」索引。
+   * 排料帧的轮廓已按摆放变换过，所以这里量出来的就是屏幕上看到的位置。
+   */
+  private rebuildPartIndex(): void {
+    this.partBoxes.clear();
+    this.partShapes.clear();
+    if (!this.layout) return;
+    for (const poly of this.polylines) {
+      const partId = this.partByPolyline.get(poly.id);
+      if (partId === undefined) continue;
+      const shapes = this.partShapes.get(partId);
+      if (shapes) shapes.push(poly);
+      else this.partShapes.set(partId, [poly]);
+
+      const box = polylineBBox(poly);
+      const prev = this.partBoxes.get(partId);
+      if (!prev) {
+        this.partBoxes.set(partId, box);
+      } else {
+        prev.minX = Math.min(prev.minX, box.minX);
+        prev.minY = Math.min(prev.minY, box.minY);
+        prev.maxX = Math.max(prev.maxX, box.maxX);
+        prev.maxY = Math.max(prev.maxY, box.maxY);
+      }
+    }
   }
 
   /** 取消拖拽视觉偏移（后端拒绝或请求超时时由外层调用） */
@@ -446,6 +482,30 @@ export class CanvasController {
   };
 
   /**
+   * 排料模式的面内命中：返回光标所在零件 id。
+   *
+   * 先用包围盒筛，再用射线法确认（点在内孔里不算命中）；
+   * 多个零件嵌套时取包围盒最小的那个，符合“按住最上面那个”的直觉。
+   */
+  private partAt(point: Point2): number | null {
+    let best: number | null = null;
+    let bestArea = Infinity;
+    for (const [partId, box] of this.partBoxes) {
+      if (point.x < box.minX || point.x > box.maxX
+        || point.y < box.minY || point.y > box.maxY) {
+        continue;
+      }
+      const area = (box.maxX - box.minX) * (box.maxY - box.minY);
+      if (area >= bestArea) continue;
+      const shapes = this.partShapes.get(partId);
+      if (shapes && !pointInPolylines(shapes, point)) continue;
+      bestArea = area;
+      best = partId;
+    }
+    return best;
+  }
+
+  /**
    * 排料模式的按下处理。返回 true 表示已接管（拖拽或只选中），
    * 返回 false 表示点在空白处，交给外层继续走框选流程。
    *
@@ -455,8 +515,12 @@ export class CanvasController {
     if (!this.app || !this.canvas) return true;
     const world = this.camera.screenToWorld(point.x, point.y,
       this.app.screen.width, this.app.screen.height);
-    const hit = pickAt(this.visiblePolylines(), world, PICK_TOLERANCE_PX / this.camera.scale);
-    const partId = hit !== null ? this.partByPolyline.get(hit) : undefined;
+    // 先按零件范围命中：点在零件内部任意位置都能拖；没命中再退回轮廓线拾取
+    let partId = this.partAt(world) ?? undefined;
+    if (partId === undefined) {
+      const hit = pickAt(this.visiblePolylines(), world, PICK_TOLERANCE_PX / this.camera.scale);
+      if (hit !== null) partId = this.partByPolyline.get(hit);
+    }
     const part = partId !== undefined ? this.partById.get(partId) : undefined;
 
     if (part && partId !== undefined) {

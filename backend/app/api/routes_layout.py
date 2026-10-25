@@ -23,6 +23,7 @@ from app.core.protocol import MsgType
 from app.core.tasks import task_queue
 from app.models import db
 from app.models.schemas import (
+    LayoutDuplicateRequest,
     LayoutFixedRotRequest,
     LayoutLockRequest,
     LayoutNestRequest,
@@ -82,6 +83,8 @@ def _respond(result: LayoutResult, published: Dict[str, Any]) -> Dict[str, Any]:
         "stats": published.get("stats", {}),
         "sheet": published.get("sheet", {}),
     }
+    # 写操作自带的额外信息（如复制件数/停靠件数）原样回给发起方
+    body.update(result.extra)
     if not result.ok:
         # 失败时把"当前真实状态"一并带回，前端据此回弹到正确位置
         body["placements"] = [p.as_dict() for p in result.state.placements.values()]
@@ -147,6 +150,20 @@ async def layout_place(req: LayoutPlaceRequest) -> Dict[str, Any]:
             return layout_service.move(conn, pid, req.partId, req.tx, req.ty, req.rot)
 
     result = await run_in_threadpool(_move)
+    meta = await _publish(result.state)
+    return _respond(result, meta)
+
+
+@router.post("/duplicate")
+async def layout_duplicate(req: LayoutDuplicateRequest) -> Dict[str, Any]:
+    """复制零件 count 份（排料板手动增件）：就近找空位，放不下的停靠到板外上方。"""
+    pid = _project_id(req.projectId)
+
+    def _copy() -> LayoutResult:
+        with db.get_conn() as conn:
+            return layout_service.duplicate(conn, pid, req.partId, req.count)
+
+    result = await run_in_threadpool(_copy)
     meta = await _publish(result.state)
     return _respond(result, meta)
 

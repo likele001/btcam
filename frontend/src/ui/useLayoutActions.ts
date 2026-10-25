@@ -26,6 +26,8 @@ export interface LayoutActions {
   applySheet: (sheet: SheetParams) => Promise<void>;
   /** 拖动结束后提交新位置 */
   movePart: (partId: number, tx: number, ty: number) => Promise<void>;
+  /** 选中零件各复制若干份（排料板增件） */
+  duplicateSelected: (count: number) => Promise<void>;
   /** 选中零件整体旋转（±角度） */
   rotateSelected: (delta: number) => Promise<void>;
   /** 选中零件整体锁定/解锁 */
@@ -107,6 +109,42 @@ export function useLayoutActions(onReject?: () => void): LayoutActions {
     [run],
   );
 
+  /**
+   * 复制选中零件：逐个提交（每个复制件的位置取决于前一个已落库的结果）。
+   * 放不下的复制件由后端停靠到板外上方，这里把件数与停靠数一并告诉用户。
+   */
+  const duplicateSelected = useCallback(async (count: number) => {
+    const store = useAppStore.getState();
+    const parts = selectedLayoutParts(store);
+    if (parts.length === 0) {
+      store.setMessage('先选中零件再复制');
+      return;
+    }
+    const copies = Math.min(99, Math.max(1, Math.floor(count)));
+    let copied = 0;
+    let parked = 0;
+    try {
+      for (const part of parts) {
+        const result = await api.layout.duplicate({
+          projectId: projectId(), partId: part.id, count: copies,
+        });
+        if (!result.ok) {
+          store.setMessage(`复制失败：${result.reason}`);
+          return;
+        }
+        copied += result.copied;
+        parked += result.parked;
+      }
+      store.setMessage(parked > 0
+        ? `已复制 ${copied} 件，${parked} 件放不下已停靠在板外上方，拖进来即可`
+        : `已复制 ${copied} 件`);
+    } catch (error) {
+      store.setMessage(`复制失败：${(error as Error).message}`);
+    } finally {
+      requestLayoutSync();
+    }
+  }, []);
+
   const rotateSelected = useCallback(
     (delta: number) => eachSelected('旋转', (part) =>
       api.layout.rotate({ projectId: projectId(), partId: part.id, rot: part.rot + delta })),
@@ -179,7 +217,7 @@ export function useLayoutActions(onReject?: () => void): LayoutActions {
   }, []);
 
   return {
-    open, applySheet, movePart, rotateSelected, lockSelected, fixedRotSelected,
+    open, applySheet, movePart, duplicateSelected, rotateSelected, lockSelected, fixedRotSelected,
     nest, cancelNest, reset,
   };
 }
