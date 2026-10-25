@@ -332,6 +332,19 @@ body {
   color: var(--text);
 }
 
+/* 长文本（引擎说明/跳过说明）：标签在上、内容在下，避免右侧值被裁掉或把标签挤没 */
+.kv-row-wide {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.kv-row-wide dd {
+  color: var(--text-dim);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 .kv-danger {
   color: var(--danger);
 }

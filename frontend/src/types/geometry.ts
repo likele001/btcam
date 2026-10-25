@@ -188,9 +188,9 @@ export interface HealthInfo {
   dataDir: string;
 }
 
-/** 刀路/排料任务统计结果（后端原样回传，字段随业务增长） */
+/** 刀路/排料任务统计结果（后端原样回传，字段随业务增长；排料的 rotation 是布尔） */
 export interface TaskStats {
-  [key: string]: number | string | null | undefined;
+  [key: string]: number | string | boolean | null | undefined;
 }
 
 /** 单条轮廓的刀路明细（TOOLPATH_PREVIEW 的 meta.contours） */
