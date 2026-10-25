@@ -43,6 +43,21 @@ from app.version import EDITION, __version__
 logger = logging.getLogger(__name__)
 
 
+def _quiet_disconnect_errors(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """压掉客户端断连产生的 loop 级噪音。
+
+    窗口关闭/刷新/拔网线时，客户端用 RST 断开，Windows 的 ProactorEventLoop
+    在 _call_connection_lost 里 shutdown 已死的 socket，会抛
+    ConnectionResetError(WinError 10054)。连接本来就没了，这条 ERROR
+    既不影响功能，又会在日志面板弹红字（面板有 error 自动弹窗），故忽略；
+    其余异常照旧交给默认处理器上报。
+    """
+    exc = context.get("exception")
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
@@ -56,6 +71,8 @@ async def lifespan(app: FastAPI):
 
     loop = asyncio.get_running_loop()
     hub.bind_loop(loop)
+    # WS 客户端断连是常态：别让 Proactor 的 ConnectionResetError 占满日志面板
+    loop.set_exception_handler(_quiet_disconnect_errors)
     await task_queue.start()
 
     engine = get_engine(settings.geometry_engine)

@@ -16,6 +16,30 @@ from pathlib import Path
 from app.core.log_store import LogRingHandler, log_store
 
 
+class _AsyncDisconnectNoise(logging.Filter):
+    """丢弃 asyncio 层「客户端已断连」这类无意义告警。
+
+    Windows 上客户端刷新/关窗口用 RST 断开时，ProactorEventLoop 回收连接会抛
+     ConnectionResetError / ConnectionAbortedError（WinError 10053/10054），
+    asyncio 默认处理器把它记成 ERROR 并进日志面板（error 自动弹窗）。
+    连接本就断了，无需告警，故丢弃；其它 asyncio 错误照常记录。
+
+    main.lifespan 已在 loop 层做了同样的拦截，这里是兜底：
+    uvicorn 重装 exception handler 或第三方代码直接 logger.error 时仍能生效。
+    """
+
+    _DISCONNECT_ERRORS = (ConnectionResetError, ConnectionAbortedError)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "asyncio":
+            return True
+        # 断连噪音一定带 traceback，按异常类型判定最准；无异常信息的记录不去猜
+        exc_type = record.exc_info[0] if record.exc_info else None
+        if exc_type is None:
+            return True
+        return not issubclass(exc_type, self._DISCONNECT_ERRORS)
+
+
 def setup_logging(level: str = "INFO", log_dir: Path | None = None,
                   capacity: int = 1000) -> None:
     if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -53,3 +77,5 @@ def setup_logging(level: str = "INFO", log_dir: Path | None = None,
 
     # 降噪：uvicorn 的访问日志太啰嗦
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # 降噪：WS 客户端断连时 Proactor 抛的 ConnectionResetError（见 _AsyncDisconnectNoise）
+    logging.getLogger("asyncio").addFilter(_AsyncDisconnectNoise())
