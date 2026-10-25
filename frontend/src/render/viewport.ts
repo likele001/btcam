@@ -18,6 +18,11 @@
  * 便于单测、也便于将来换 Vue/Svelte 时复用。
  */
 
+// PixiJS 默认用 new Function 生成 uniform/shader 的同步代码，而打包版的 CSP 是
+// script-src 'self'（不允许 unsafe-eval，dev 环境才有豁免），会让 app.init() 直接抛错、
+// 画布停在初始 300x150 的空白状态。这个子模块用等价的 eval-free 实现覆盖内部生成器，
+// 是 Pixi 官方给受限 CSP 环境的方案；必须在 new Application() 之前执行，故放在首行 import。
+import 'pixi.js/unsafe-eval';
 import { Application, Container, Graphics } from 'pixi.js';
 
 import type { BBox, LayerInfo, LayoutPartInfo, LayoutState, Polyline, SheetSpec } from '@/types/geometry';

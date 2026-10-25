@@ -89,6 +89,10 @@ export function Viewport({ onReady }: ViewportProps): JSX.Element {
       if (disposed) return;
       controller.fitToContent();
       onReady(controller);
+    }).catch((err: unknown) => {
+      // 初始化失败（WebGL 不可用 / 资源加载失败等）不能让界面静默白屏，状态栏给出原因
+      const message = err instanceof Error ? err.message : String(err);
+      useAppStore.getState().setMessage(`画布初始化失败：${message}`);
     });
 
     return () => {
